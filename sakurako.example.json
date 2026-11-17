@@ -1,0 +1,19 @@
+{
+  "listen": ":40772",
+  "sync_seconds": 30,
+  "catalog_timeout_seconds": 10,
+  "max_stale_seconds": 3600,
+  "stream_timeout_seconds": 30,
+  "backends": [
+    {
+      "id": "tokyo",
+      "url": "http://192.168.1.10:40772/api",
+      "priority": 100
+    },
+    {
+      "id": "osaka",
+      "url": "http://192.168.2.10:40772/api",
+      "priority": 100
+    }
+  ]
+}
