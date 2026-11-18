@@ -71,6 +71,13 @@ docker compose up -d
 
 `max_stale_seconds` は `sync_seconds + catalog_timeout_seconds` 以上にします。[設定例](sakurako.example.json)も参照してください。
 
+`channel_names` に `upstream` を指定すると、接続先が違っても同じ名前のチャンネルは 1 つにまとまります。同じ `service_domain` を設定した接続先どうしで、同じ名前のチャンネルが別の放送（`networkId` が異なる）を指している場合、そのチャンネルは優先度が最も高い接続先と同じ `networkId` のソースだけを残します（同じ放送の予備はそのまま使えます）。別の放送へは切り替えず、優先度が最も高い接続先の情報が古くなった場合も、同じ `networkId` の予備が使えなければそのチャンネルの配信を止めます。同じ `service_domain` に同じ放送の予備が無ければ、別の `service_domain` にある同名チャンネルにも切り替えません。この競合は `/healthz` の `conflicting_channels` とログに表示され、`conflicting_service_ids` と同じく `/healthz` は 503（`ready: false`）になります。
+
+競合の判定には、最後に取得できたサービス情報を持つ接続先をすべて使います。そのため次の制約があります。
+
+- BS/CS では `networkId` が多くの放送で共通なので、別の放送を指していてもこの仕組みでは検出できません。実質的には GR 向けの保護です。
+- sakurako の起動直後、優先度が最も高い接続先からまだ一度もサービス情報を取得できていない場合は、競合を検出できません。
+
 ## 仕組み
 
 - **情報の集約**：各 Mirakurun のサービス・番組情報を定期的に取得します。チャンネル名は `tokyo-3237` のように接続先ごとに区別します。
