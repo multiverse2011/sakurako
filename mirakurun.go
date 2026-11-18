@@ -15,20 +15,29 @@ import (
 // snapshot: Mirakurun clients use it to see who holds each tuner right now.
 // Backends are queried in parallel so one slow backend does not use up the whole
 // timeout, and a failed backend is logged instead of failing the response.
+// Only when every backend fails is the response a 503.
 func (g *Gateway) tuners(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(g.config.CatalogTimeoutSeconds)*time.Second)
 	defer cancel()
-	lists := make([][]object, len(g.backends))
-	errs := make([]error, len(g.backends))
+	g.mu.RLock()
+	backends := append([]backend(nil), g.backends...)
+	g.mu.RUnlock()
+	lists := make([][]object, len(backends))
+	errs := make([]error, len(backends))
 	var wg sync.WaitGroup
-	for i := range g.backends {
+	for i := range backends {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lists[i], errs[i] = g.fetch(ctx, g.backends[i], "/tuners")
+			lists[i], errs[i] = g.fetch(ctx, backends[i], "/tuners")
 		}()
 	}
 	wg.Wait()
+	// A disconnected client is not a backend failure; Sync skips shutdown
+	// cancellations the same way.
+	if r.Context().Err() != nil {
+		return
+	}
 	out := []object{}
 	ok := 0
 	for i, list := range lists {

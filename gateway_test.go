@@ -68,6 +68,7 @@ type fakeBackend struct {
 	failServices       int
 	failPrograms       int
 	failTuners         int
+	stallTuners        bool
 }
 
 func fixture(n, s int64, name string) (object, object) {
@@ -84,6 +85,7 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 		oneChunk, reset := f.oneChunk, f.resetAfterChunk
 		continuous := f.continuous
 		failServices, failPrograms, failTuners := f.failServices, f.failPrograms, f.failTuners
+		stallTuners := f.stallTuners
 		oversizeServices, oversizePrograms := f.oversizeServices, f.oversizePrograms
 		location, statusFor := f.streamLocation, f.streamStatusFor
 		s, p := f.services, f.programs
@@ -106,6 +108,10 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 		case "/api/tuners":
 			if failTuners != 0 {
 				http.Error(w, "down", failTuners)
+				return
+			}
+			if stallTuners {
+				<-r.Context().Done()
 				return
 			}
 			list := f.tuners

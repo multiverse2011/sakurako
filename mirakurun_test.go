@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -126,7 +127,6 @@ func TestTunersAggregationAndChannelRewrite(t *testing.T) {
 	b.mu.Lock()
 	b.down = true
 	b.mu.Unlock()
-	tuners = nil
 	getJSON(t, s.URL+"/api/tuners", 200, &tuners)
 	if len(tuners) != 1 || tuners[0]["name"] != "region0/tuner" {
 		t.Fatalf("down backend leaked into tuners: %v", tuners)
@@ -139,30 +139,87 @@ func TestTunersPartialBackendFailure(t *testing.T) {
 	b.tuners = []object{tunerFixture(4, "tuner")}
 	_, s := configGateway(t, Config{}, a, b)
 
-	expectHealthyOnly := func() {
+	expectOne := func(name string, index int64) {
 		t.Helper()
 		var tuners []object
 		getJSON(t, s.URL+"/api/tuners", 200, &tuners)
-		if len(tuners) != 1 || tuners[0]["name"] != "region0/tuner" {
+		if len(tuners) != 1 || tuners[0]["name"] != name || number(tuners[0], "index") != index {
 			t.Fatalf("tuners %v", tuners)
 		}
 	}
 
-	// An HTTP error on one backend leaves the other backend's tuners visible.
+	// A failing first backend must not shift the later backend's index band or name prefix.
+	a.mu.Lock()
+	a.failTuners = 500
+	a.mu.Unlock()
+	expectOne("region1/tuner", 10004)
+
+	// An HTTP error on the second backend leaves the first backend's tuners visible.
+	a.mu.Lock()
+	a.failTuners = 0
+	a.mu.Unlock()
 	b.mu.Lock()
 	b.failTuners = 500
 	b.mu.Unlock()
-	expectHealthyOnly()
+	expectOne("region0/tuner", 4)
 
 	// An unreachable backend is skipped the same way.
 	b.server.Close()
-	expectHealthyOnly()
+	expectOne("region0/tuner", 4)
 
 	// 503 only when every backend fails.
 	a.mu.Lock()
 	a.failTuners = 500
 	a.mu.Unlock()
-	getJSON(t, s.URL+"/api/tuners", 503, nil)
+	var e object
+	getJSON(t, s.URL+"/api/tuners", 503, &e)
+	if number(e, "code") != 503 || e["reason"] != "tuner state unavailable from all backends" {
+		t.Fatalf("error body %v", e)
+	}
+}
+
+func TestTunersSlowBackend(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
+	a.tuners = []object{tunerFixture(4, "tuner")}
+	b.tuners = []object{tunerFixture(4, "tuner")}
+	a.mu.Lock()
+	a.stallTuners = true
+	a.mu.Unlock()
+	_, s := configGateway(t, Config{}, a, b)
+
+	// The stalled backend waits for CatalogTimeoutSeconds; the healthy one must
+	// still answer 200 instead of the timeout turning into a 503.
+	var tuners []object
+	getJSON(t, s.URL+"/api/tuners", 200, &tuners)
+	if len(tuners) != 1 || tuners[0]["name"] != "region1/tuner" || number(tuners[0], "index") != 10004 {
+		t.Fatalf("tuners %v", tuners)
+	}
+}
+
+func TestTunersConcurrentSync(t *testing.T) {
+	a := newFake(t, 10, "A")
+	a.tuners = []object{tunerFixture(4, "tuner")}
+	g, s := configGateway(t, Config{}, a)
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				g.Sync(context.Background())
+			}
+		}
+	}()
+	for range 20 {
+		getJSON(t, s.URL+"/api/tuners", 200, nil)
+	}
+	close(done)
+	wg.Wait()
 }
 
 func TestUpstreamChannelNames(t *testing.T) {
