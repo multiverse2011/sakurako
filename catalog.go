@@ -50,8 +50,9 @@ type catalog struct {
 	channelSources               map[string][]source // exposed channel type + "/" + channel name
 	conflicts                    []int64
 	channelConflicts             []channelConflict
-	// expires is when a backend first stops being fresh without a sync. Zero
-	// means only a sync can change the catalog. buildCatalog sets it under mu
+	// expires is the instant after which a backend is no longer fresh without a
+	// sync (at exactly expires it still is). Zero means only a sync can change
+	// the catalog. buildCatalog sets it under mu
 	// like the rest of the catalog; copies it returns are read-only and not
 	// part of any response.
 	expires time.Time
@@ -334,17 +335,19 @@ func (g *Gateway) Run(ctx context.Context) {
 }
 
 // catalogNow returns the catalog committed by the last sync. Requests only pay to
-// copy it: it is rebuilt by Sync, or when a backend expires between syncs.
+// copy it: it is rebuilt by Sync, or after a backend expires between syncs. The
+// comparison is strict to match buildCatalog, which keeps a backend at exactly
+// max_stale: rebuilding there would recompute the same expires on every request.
 func (g *Gateway) catalogNow(now time.Time) catalog {
 	g.mu.RLock()
 	c := g.cat
 	g.mu.RUnlock()
-	if c.expires.IsZero() || now.Before(c.expires) {
+	if c.expires.IsZero() || !now.After(c.expires) {
 		return c
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.cat.expires.IsZero() || now.Before(g.cat.expires) {
+	if g.cat.expires.IsZero() || !now.After(g.cat.expires) {
 		return g.cat // another request rebuilt it while this one waited
 	}
 	g.cat = g.buildCatalog(now)

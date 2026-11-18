@@ -133,6 +133,29 @@ func TestCatalogExpiresBetweenSyncs(t *testing.T) {
 	}
 }
 
+// At exactly expires a backend is still fresh (buildCatalog drops it only once it
+// is older than max_stale), so that instant must not trigger a rebuild.
+func TestCatalogIsNotRebuiltAtExpiryBoundary(t *testing.T) {
+	a := newFake(t, 10, "A")
+	c := Config{Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 2, StreamTimeoutSeconds: 1,
+		Backends: []BackendConfig{{ID: "a", URL: a.server.URL + "/api"}}}
+	g, err := NewGateway(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Sync(context.Background())
+	base := time.Now()
+	changeBackend(g, 0, func(b *backend) { b.updated = base })
+
+	// Removing the backend's data without republishing makes a rebuild visible.
+	g.mu.Lock()
+	g.backends[0].services = []object{}
+	g.mu.Unlock()
+	if got := g.catalogNow(base.Add(2 * time.Second)); len(got.services) != 1 {
+		t.Fatalf("rebuilt at the expiry boundary: %v", got.services)
+	}
+}
+
 // The same expiry, with a conflicting channel name: without a sync, an expired
 // winner must keep the conflict and must not fail over to another broadcast.
 // catalogNow publishes the catalog rebuilt at the injected instant, so the
