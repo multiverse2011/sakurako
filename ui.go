@@ -6,7 +6,6 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -76,7 +75,12 @@ func (g *Gateway) serveUI(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if r.URL.Path == "/-/ui/tuners" {
 		w.Header().Set("Cache-Control", "no-store")
-		respond(w, 200, g.tunerCounts(r.Context()))
+		// HEAD only reports the headers; the counts are a live query per backend.
+		if r.Method != "HEAD" {
+			if counts := g.tunerCounts(r.Context()); counts != nil {
+				respond(w, 200, counts)
+			}
+		}
 		return true
 	}
 	if r.URL.Path == "/-/ui/config" {
@@ -203,36 +207,45 @@ func (g *Gateway) uiState(now time.Time) object {
 
 // tunerCounts summarizes live tuner state for the UI. It has its own route
 // because every call queries the backends; the 1-second /-/ui/state poll must not.
-// A backend that fails is left out so the UI can render just that row as unknown.
+// A backend that fails is left out so the UI can render just that row as unknown;
+// failures are not logged here because the UI polls this every few seconds.
 func (g *Gateway) tunerCounts(ctx context.Context) object {
-	lists, errs := g.fetchTuners(ctx)
+	ids, lists, errs := g.fetchTuners(ctx)
+	// A disconnected client is not a backend failure; Sync skips shutdown
+	// cancellations the same way.
+	if ctx.Err() != nil {
+		return nil
+	}
 	backends := []object{}
-	inUse, total, fault := 0, 0, 0
+	inUse, total, free, fault := 0, 0, 0, 0
 	for i, list := range lists {
 		if errs[i] != nil {
-			log.Printf("ui tuners: %v", errs[i])
 			continue
 		}
-		used, all, broken := countTuners(list)
-		inUse, total, fault = inUse+used, total+all, fault+broken
-		backends = append(backends, object{"id": g.backends[i].config.ID, "in_use": used, "total": all, "free": all - used, "fault": broken})
+		used, all, idle, broken := countTuners(list)
+		inUse, total, free, fault = inUse+used, total+all, free+idle, fault+broken
+		backends = append(backends, object{"id": ids[i], "in_use": used, "total": all, "free": idle, "fault": broken})
 	}
-	return object{"available": len(backends) > 0, "in_use": inUse, "total": total, "free": total - inUse, "fault": fault, "backends": backends}
+	return object{"available": len(backends) > 0, "in_use": inUse, "total": total, "free": free, "fault": fault, "backends": backends}
 }
 
-// countTuners returns how many tuners are allocated, how many exist, and how many are faulty.
-func countTuners(list []object) (inUse, total, fault int) {
+// countTuners splits a backend's tuners into in use, free and faulty, so a faulty
+// tuner is never counted as an allocation or as something that can be allocated.
+// isUsing is checked as well as users because not every Mirakurun reports both.
+func countTuners(list []object) (inUse, total, free, fault int) {
 	for _, t := range list {
 		total++
-		if t["isFault"] == true {
-			fault++
-		}
 		users, _ := t["users"].([]any)
-		if t["isUsing"] == true || len(users) > 0 {
+		switch {
+		case t["isFault"] == true:
+			fault++
+		case t["isUsing"] == true || len(users) > 0:
 			inUse++
+		default:
+			free++
 		}
 	}
-	return inUse, total, fault
+	return inUse, total, free, fault
 }
 
 // mirakurunUIURL preserves reverse-proxy prefixes while removing the Mirakurun API suffix.

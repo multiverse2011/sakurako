@@ -14,17 +14,19 @@ import (
 )
 
 // fetchTuners queries every backend in parallel, so one slow backend does not
-// use up the whole timeout. Err entries stay aligned with the backend index.
-func (g *Gateway) fetchTuners(parent context.Context) ([][]object, []error) {
+// use up the whole timeout. ids, lists and errs stay aligned by backend index.
+func (g *Gateway) fetchTuners(parent context.Context) (ids []string, lists [][]object, errs []error) {
 	ctx, cancel := context.WithTimeout(parent, time.Duration(g.config.CatalogTimeoutSeconds)*time.Second)
 	defer cancel()
 	g.mu.RLock()
 	backends := append([]backend(nil), g.backends...)
 	g.mu.RUnlock()
-	lists := make([][]object, len(backends))
-	errs := make([]error, len(backends))
+	ids = make([]string, len(backends))
+	lists = make([][]object, len(backends))
+	errs = make([]error, len(backends))
 	var wg sync.WaitGroup
 	for i := range backends {
+		ids[i] = backends[i].config.ID
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -32,7 +34,7 @@ func (g *Gateway) fetchTuners(parent context.Context) ([][]object, []error) {
 		}()
 	}
 	wg.Wait()
-	return lists, errs
+	return ids, lists, errs
 }
 
 // tuners aggregates live tuner state. Unlike catalog endpoints it cannot use a
@@ -40,7 +42,7 @@ func (g *Gateway) fetchTuners(parent context.Context) ([][]object, []error) {
 // A failed backend is logged instead of failing the response; only when every
 // backend fails is the response a 503.
 func (g *Gateway) tuners(w http.ResponseWriter, r *http.Request) {
-	lists, errs := g.fetchTuners(r.Context())
+	_, lists, errs := g.fetchTuners(r.Context())
 	// A disconnected client is not a backend failure; Sync skips shutdown
 	// cancellations the same way.
 	if r.Context().Err() != nil {

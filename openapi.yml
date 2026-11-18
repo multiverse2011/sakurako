@@ -281,7 +281,7 @@
           "description": "False when no backend could be queried; the counts are then meaningless."
           "type": "boolean"
         "backends":
-          "description": "Only backends that answered; a failing backend is omitted and logged."
+          "description": "Only backends that answered; a failing backend is omitted."
           "items":
             "additionalProperties": true
             "properties":
@@ -298,9 +298,10 @@
             "type": "object"
           "type": "array"
         "fault":
-          "description": "Tuners reporting isFault."
+          "description": "Tuners reporting isFault; they are counted neither as in use nor as free."
           "type": "integer"
         "free":
+          "description": "Neither in use nor faulty."
           "type": "integer"
         "in_use":
           "type": "integer"
@@ -383,7 +384,7 @@
         - "Monitoring"
   "/-/ui/tuners":
     "get":
-      "description": "Sakurako-specific live tuner counts (allocated / total / free / fault) overall and per backend, for the management UI. Backends that fail are omitted and logged; the 1-second /-/ui/state poll must not carry these live queries. Cache-Control: no-store."
+      "description": "Sakurako-specific live tuner counts (in use / total / free / fault) overall and per backend, for the management UI. A failed backend is omitted, so the UI can show that backend as unknown. Cache-Control: no-store."
       "responses":
         "200":
           "content":
@@ -407,7 +408,7 @@
       "tags":
         - "Monitoring"
     "head":
-      "description": "Queries the backends exactly like GET without returning a body."
+      "description": "Returns the same headers as GET without querying the backends."
       "responses":
         "200":
           "description": "Headers only; no body"

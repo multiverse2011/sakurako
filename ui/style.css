@@ -18,7 +18,7 @@
 /* SVG connectors use the measured card edges, including unequal card heights. */
 .arrow,.clients .node:before,.clients .node:after{visibility:hidden}.connections{position:absolute;inset:0;pointer-events:none;overflow:visible;z-index:2}.flow .node{position:relative;z-index:3}.upstream-link{padding:0;background:none;height:0}@media(max-width:650px){.connections,.upstream-link{display:none}}
 
-#backend-summary{display:block;margin-top:8px;font-size:11px;color:#7b6470}.badge.error{background:#fbe0e1;color:#a1313b}.backend-unavailable{background:#fff8f8}
+#backend-summary,#tuner-summary{display:block;margin-top:8px;font-size:11px}#backend-summary{color:#7b6470}.badge.error{background:#fbe0e1;color:#a1313b}.backend-unavailable{background:#fff8f8}
 
 /* Source boundaries group Mirakurun servers while the Sakurako boundary stays continuous. */
 .source-server{position:relative;padding:48px 0 4px;margin:12px 0 24px}
@@ -43,4 +43,4 @@ header nav{flex:1}@media(max-width:650px){header nav{flex:1 0 100%;order:3;flex-
 .log-line{padding:1px 0}
 #settings-config th{width:220px;color:var(--muted);font-weight:400}
 
-#tuner-summary{display:block;margin-top:8px;font-size:11px}.tuner-fault{color:#a1313b}#tuner-summary.tuner-fault{color:#a1313b;font-weight:600}td.tuner-fault{font-weight:600}
+.tuner-fault{color:#a1313b;font-weight:600}
