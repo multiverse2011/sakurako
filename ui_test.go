@@ -161,16 +161,16 @@ func TestEmbeddedAPIDocs(t *testing.T) {
 	}
 }
 
-// Backends 表の見出しが、転送量ではなく件数であることを示しているか（トラフィック欄は帯域）。
+// The Backends table must say counts, not traffic: "Downstream Traffic" is the bandwidth metric.
 func TestBackendsColumnIsNotTraffic(t *testing.T) {
 	html, err := uiFiles.ReadFile("ui/index.html")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(html), "Upstream / Downstream") {
+	if strings.Contains(string(html), ">Upstream / Downstream</th>") {
 		t.Fatal("ambiguous Upstream / Downstream header")
 	}
-	if !strings.Contains(string(html), "Streams / Clients") {
+	if !strings.Contains(string(html), ">Streams / Clients</th>") {
 		t.Fatal("missing Streams / Clients header")
 	}
 }
