@@ -28,10 +28,11 @@ type uiAsset struct {
 	etag, gzEtag  string
 }
 
-// uiAssets compresses at startup: the Scalar bundle is 4.8 MB, so compressing it
-// per request would cost more than sending it.
+// uiAssets compresses each file once at startup; requests then only pick a
+// cached representation.
 var uiAssets = func() map[string]*uiAsset {
 	assets := map[string]*uiAsset{}
+	// Files served under /ui/; add new assets here too.
 	for _, name := range []string{"theme.js", "theme.css", "index.html", "style.css", "app.js", "docs.html", "docs.js", "favicon.svg", "vendor/scalar-standalone.js"} {
 		data, err := uiFiles.ReadFile("ui/" + name)
 		if err != nil {
@@ -63,15 +64,15 @@ func gzipBytes(data []byte) []byte {
 }
 
 // acceptsGzip parses Accept-Encoding, honoring explicit q=0 exclusions over the
-// wildcard. Shared with API compression so both agree on the header.
+// wildcard.
 func acceptsGzip(header string) bool {
 	gzipQ, wildcardQ := -1.0, -1.0
 	for _, entry := range strings.Split(header, ",") {
 		fields := strings.Split(strings.TrimSpace(entry), ";")
 		q := 1.0
 		for _, param := range fields[1:] {
-			if value, ok := strings.CutPrefix(strings.TrimSpace(param), "q="); ok {
-				if parsed, err := strconv.ParseFloat(value, 64); err == nil {
+			if name, value, ok := strings.Cut(strings.TrimSpace(param), "="); ok && strings.EqualFold(strings.TrimSpace(name), "q") {
+				if parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
 					q = parsed
 				}
 			}
@@ -223,6 +224,7 @@ func serveUIAsset(w http.ResponseWriter, r *http.Request, asset *uiAsset) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	if r.Method != http.MethodHead {
 		w.Write(data)
 	}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -308,9 +309,9 @@ func uiGet(g *Gateway, method, path, accept, ifNoneMatch string) *httptest.Respo
 
 func TestUIAssetsConditionalRequests(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"))
-	for _, path := range []string{"/ui/", "/ui/app.js", "/ui/theme.css", "/ui/favicon.svg", "/ui/docs.html", "/ui/docs.js", "/ui/vendor/scalar-standalone.js"} {
+	for name := range uiAssets {
+		path := "/ui/" + name
 		etags := map[string]string{}
-		gzipServed := false
 		for _, accept := range []string{"", "gzip"} {
 			w := uiGet(g, "GET", path, accept, "")
 			etag := w.Header().Get("ETag")
@@ -318,24 +319,39 @@ func TestUIAssetsConditionalRequests(t *testing.T) {
 				t.Fatalf("%s accept %q: %d ETag %q", path, accept, w.Code, etag)
 			}
 			if w.Header().Get("Vary") != "Accept-Encoding" {
-				t.Fatalf("%s: Vary %q", path, w.Header().Get("Vary"))
+				t.Fatalf("%s accept %q: Vary %q", path, accept, w.Header().Get("Vary"))
 			}
-			gzipServed = gzipServed || w.Header().Get("Content-Encoding") == "gzip"
+			wantEncoding := ""
+			if accept == "gzip" {
+				wantEncoding = "gzip"
+			}
+			if got := w.Header().Get("Content-Encoding"); got != wantEncoding {
+				t.Fatalf("%s accept %q: Content-Encoding %q", path, accept, got)
+			}
+			if got, want := w.Header().Get("Content-Length"), strconv.Itoa(w.Body.Len()); got != want {
+				t.Fatalf("%s accept %q: Content-Length %q, want %q", path, accept, got, want)
+			}
 			etags[accept] = etag
-			w = uiGet(g, "GET", path, accept, etag)
-			if w.Code != http.StatusNotModified || w.Body.Len() != 0 || w.Header().Get("ETag") != etag {
-				t.Fatalf("%s accept %q: revalidation %d ETag %q body %d", path, accept, w.Code, w.Header().Get("ETag"), w.Body.Len())
+			for _, candidate := range []string{etag, "W/" + etag, `"stale", ` + etag} {
+				w = uiGet(g, "GET", path, accept, candidate)
+				if w.Code != http.StatusNotModified || w.Body.Len() != 0 || w.Header().Get("ETag") != etag {
+					t.Fatalf("%s accept %q candidate %q: revalidation %d ETag %q body %d", path, accept, candidate, w.Code, w.Header().Get("ETag"), w.Body.Len())
+				}
+				if w.Header().Get("Vary") != "Accept-Encoding" {
+					t.Fatalf("%s accept %q: 304 Vary %q", path, accept, w.Header().Get("Vary"))
+				}
+				if got := w.Header().Get("Content-Encoding"); got != wantEncoding {
+					t.Fatalf("%s accept %q: 304 Content-Encoding %q", path, accept, got)
+				}
 			}
 		}
-		// Assets too small to compress have a single representation and one ETag.
-		if gzipServed && etags[""] == etags["gzip"] {
+		// Whenever two representations are served, their ETags must differ.
+		if etags[""] == etags["gzip"] {
 			t.Fatalf("%s: encodings share an ETag %q", path, etags[""])
 		}
-		if gzipServed {
-			// A client holding the identity body must not get a 304 for the gzip variant.
-			if w := uiGet(g, "GET", path, "gzip", etags[""]); w.Code != 200 {
-				t.Fatalf("%s: identity ETag answered gzip request with %d", path, w.Code)
-			}
+		// A client holding the identity body must not get a 304 for the gzip variant.
+		if w := uiGet(g, "GET", path, "gzip", etags[""]); w.Code != 200 {
+			t.Fatalf("%s: identity ETag answered gzip request with %d", path, w.Code)
 		}
 	}
 }
@@ -368,21 +384,29 @@ func TestUIAssetsGzip(t *testing.T) {
 
 func TestUIAssetsHead(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"))
-	get := uiGet(g, "GET", "/ui/app.js", "gzip", "")
-	head := uiGet(g, "HEAD", "/ui/app.js", "gzip", "")
-	if head.Body.Len() != 0 {
-		t.Fatal("HEAD served body")
-	}
-	for header, want := range map[string]string{"ETag": get.Header().Get("ETag"), "Content-Encoding": "gzip", "Content-Type": get.Header().Get("Content-Type"), "Vary": "Accept-Encoding"} {
-		if got := head.Header().Get(header); got != want {
-			t.Fatalf("HEAD %s: %q, want %q", header, got, want)
+	for _, accept := range []string{"", "gzip"} {
+		get := uiGet(g, "GET", "/ui/app.js", accept, "")
+		head := uiGet(g, "HEAD", "/ui/app.js", accept, "")
+		if head.Body.Len() != 0 {
+			t.Fatal("HEAD served body")
 		}
-	}
-	if head.Code != 200 {
-		t.Fatalf("HEAD: %d", head.Code)
-	}
-	if w := uiGet(g, "HEAD", "/ui/app.js", "gzip", get.Header().Get("ETag")); w.Code != http.StatusNotModified || w.Body.Len() != 0 {
-		t.Fatalf("HEAD revalidation: %d body %d", w.Code, w.Body.Len())
+		for header, want := range map[string]string{
+			"ETag":             get.Header().Get("ETag"),
+			"Content-Encoding": get.Header().Get("Content-Encoding"),
+			"Content-Type":     get.Header().Get("Content-Type"),
+			"Vary":             "Accept-Encoding",
+			"Content-Length":   strconv.Itoa(get.Body.Len()),
+		} {
+			if got := head.Header().Get(header); got != want {
+				t.Fatalf("HEAD accept %q %s: %q, want %q", accept, header, got, want)
+			}
+		}
+		if head.Code != 200 {
+			t.Fatalf("HEAD: %d", head.Code)
+		}
+		if w := uiGet(g, "HEAD", "/ui/app.js", accept, get.Header().Get("ETag")); w.Code != http.StatusNotModified || w.Body.Len() != 0 {
+			t.Fatalf("HEAD revalidation: %d body %d", w.Code, w.Body.Len())
+		}
 	}
 }
 
@@ -395,6 +419,7 @@ func TestAcceptsGzip(t *testing.T) {
 		"x-gzip":                  true,
 		"gzip, deflate, br":       true,
 		"gzip;q=0":                false,
+		"gzip;Q=0":                false,
 		"gzip;q=0, identity":      false,
 		"gzip;q=0.5":              true,
 		"gzip;q=0.001":            true,
