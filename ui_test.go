@@ -209,6 +209,7 @@ func TestLogsPanelOffersPauseAndFilters(t *testing.T) {
 	}
 }
 
+// The test assumes every element app.js looks up with $() is present in index.html's static markup.
 func TestAppScriptReferencesExistingElements(t *testing.T) {
 	markup, err := uiFiles.ReadFile("ui/index.html")
 	if err != nil {
