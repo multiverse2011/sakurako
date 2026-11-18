@@ -1150,7 +1150,7 @@
         - "Streaming"
   "/api/tuners":
     "get":
-      "description": "Live aggregated tuner state from every backend. Channel names in users' stream settings follow channel_names. With multiple backends, index values are scoped (10000 per backend) and names are prefixed with the backend ID."
+      "description": "Live aggregated tuner state from every backend. Channel names in users' stream settings follow channel_names. With multiple backends, index values are scoped (10000 per backend) and names are prefixed with the backend ID. Backends that fail are omitted and logged; 503 only when every backend fails."
       "responses":
         "200":
           "content":
@@ -1177,12 +1177,12 @@
             "application/json":
               "schema":
                 "$ref": "#/components/schemas/Error"
-          "description": "Tuner state unavailable from a backend"
+          "description": "Tuner state unavailable from all backends"
       "summary": "List tuners"
       "tags":
         - "Monitoring"
     "head":
-      "description": "Fetches the same live tuner state as GET without returning a body."
+      "description": "Fetches the same live tuner state as GET without returning a body. Failed backends are omitted and logged."
       "responses":
         "200":
           "description": "Headers only; no body"
@@ -1197,7 +1197,7 @@
             "application/json":
               "schema":
                 "$ref": "#/components/schemas/Error"
-          "description": "Tuner state unavailable from a backend"
+          "description": "Tuner state unavailable from all backends"
       "summary": "List tuners (headers only)"
       "tags":
         - "Monitoring"

@@ -126,6 +126,42 @@ func TestTunersAggregationAndChannelRewrite(t *testing.T) {
 	b.mu.Lock()
 	b.down = true
 	b.mu.Unlock()
+	tuners = nil
+	getJSON(t, s.URL+"/api/tuners", 200, &tuners)
+	if len(tuners) != 1 || tuners[0]["name"] != "region0/tuner" {
+		t.Fatalf("down backend leaked into tuners: %v", tuners)
+	}
+}
+
+func TestTunersPartialBackendFailure(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
+	a.tuners = []object{tunerFixture(4, "tuner")}
+	b.tuners = []object{tunerFixture(4, "tuner")}
+	_, s := configGateway(t, Config{}, a, b)
+
+	expectHealthyOnly := func() {
+		t.Helper()
+		var tuners []object
+		getJSON(t, s.URL+"/api/tuners", 200, &tuners)
+		if len(tuners) != 1 || tuners[0]["name"] != "region0/tuner" {
+			t.Fatalf("tuners %v", tuners)
+		}
+	}
+
+	// An HTTP error on one backend leaves the other backend's tuners visible.
+	b.mu.Lock()
+	b.failTuners = 500
+	b.mu.Unlock()
+	expectHealthyOnly()
+
+	// An unreachable backend is skipped the same way.
+	b.server.Close()
+	expectHealthyOnly()
+
+	// 503 only when every backend fails.
+	a.mu.Lock()
+	a.failTuners = 500
+	a.mu.Unlock()
 	getJSON(t, s.URL+"/api/tuners", 503, nil)
 }
 

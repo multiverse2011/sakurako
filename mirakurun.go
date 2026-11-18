@@ -7,26 +7,44 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
 // tuners aggregates live tuner state. Unlike catalog endpoints it cannot use a
 // snapshot: Mirakurun clients use it to see who holds each tuner right now.
+// Backends are queried in parallel so one slow backend does not use up the whole
+// timeout, and a failed backend is logged instead of failing the response.
 func (g *Gateway) tuners(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(g.config.CatalogTimeoutSeconds)*time.Second)
 	defer cancel()
-	out := []object{}
+	lists := make([][]object, len(g.backends))
+	errs := make([]error, len(g.backends))
+	var wg sync.WaitGroup
 	for i := range g.backends {
-		list, err := g.fetch(ctx, g.backends[i], "/tuners")
-		if err != nil {
-			log.Printf("tuners: %v", err)
-			apiError(w, 503, "tuner state unavailable from a backend")
-			return
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lists[i], errs[i] = g.fetch(ctx, g.backends[i], "/tuners")
+		}()
+	}
+	wg.Wait()
+	out := []object{}
+	ok := 0
+	for i, list := range lists {
+		if errs[i] != nil {
+			log.Printf("tuners: %v", errs[i])
+			continue
 		}
+		ok++
 		for _, t := range list {
 			g.exposeTuner(t, i)
 			out = append(out, t)
 		}
+	}
+	if ok == 0 {
+		apiError(w, 503, "tuner state unavailable from all backends")
+		return
 	}
 	respond(w, 200, out)
 }

@@ -238,12 +238,12 @@ func endpoints() []endpoint {
 			tags: monitoring,
 			get: operation{
 				summary:     "List tuners",
-				description: "Live aggregated tuner state from every backend. Channel names in users' stream settings follow channel_names. With multiple backends, index values are scoped (10000 per backend) and names are prefixed with the backend ID.",
+				description: "Live aggregated tuner state from every backend. Channel names in users' stream settings follow channel_names. With multiple backends, index values are scoped (10000 per backend) and names are prefixed with the backend ID. Backends that fail are omitted and logged; 503 only when every backend fails.",
 				responses:   getResponsesWith(success(arrayOf("Tuner")), tunerResponseOverrides, "400", "503"),
 			},
 			head: operation{
 				summary:     "List tuners (headers only)",
-				description: "Fetches the same live tuner state as GET without returning a body.",
+				description: "Fetches the same live tuner state as GET without returning a body. Failed backends are omitted and logged.",
 				responses:   headResponsesWith(tunerResponseOverrides, "400", "503"),
 			},
 		},
@@ -309,7 +309,7 @@ var responseDescriptions = map[string]string{
 // tunerResponseOverrides replaces the shared texts that do not fit /api/tuners.
 var tunerResponseOverrides = map[string]string{
 	"400": "Query options are not supported here",
-	"503": "Tuner state unavailable from a backend",
+	"503": "Tuner state unavailable from all backends",
 }
 
 // errorResponses fails loudly instead of emitting a response with no description.
