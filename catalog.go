@@ -49,14 +49,19 @@ type catalog struct {
 	sources                      map[int64][]source
 	channelSources               map[string][]source // exposed channel type + "/" + channel name
 	conflicts                    []int64
-	channelConflicts             []string // exposed channel type + "/" + channel name
+	channelConflicts             []channelConflict
+}
+
+// channelConflict is one exposed channel name that several broadcasts answer to.
+type channelConflict struct {
+	key    string // exposed channel type + "/" + channel name
+	detail string // for logs: winner backend and each backend's networkId
 }
 
 // channelEntry is one service's view of an exposed channel, filtered after the
 // preferred backend for that channel name is known.
 type channelEntry struct {
 	key, domain      string
-	backend          int
 	channel, service object
 }
 
@@ -285,14 +290,18 @@ func (g *Gateway) logChannelConflicts() {
 	g.mu.RLock()
 	cat := g.snapshot(time.Now())
 	g.mu.RUnlock()
-	signature := strings.Join(cat.channelConflicts, ",")
+	details := make([]string, 0, len(cat.channelConflicts))
+	for _, conflict := range cat.channelConflicts {
+		details = append(details, conflict.detail)
+	}
+	signature := strings.Join(details, "; ")
 	if signature == g.loggedChannelConflicts {
 		return
 	}
 	previous := g.loggedChannelConflicts
 	g.loggedChannelConflicts = signature
 	if signature != "" {
-		log.Printf("warning: channel %s is shared by backends with different networkIds; keeping only the highest-priority backend and no failover", signature)
+		log.Printf("warning: channel name shared by different broadcasts: %s; keeping only the priority winner's networkId sources and no failover", signature)
 	} else if previous != "" {
 		log.Print("channel conflicts resolved")
 	}
@@ -314,11 +323,13 @@ func (g *Gateway) Run(ctx context.Context) {
 
 // Called under mu. Responses depend only on local snapshots, never live backend requests.
 func (g *Gateway) snapshot(now time.Time) catalog {
-	c := catalog{services: []object{}, programs: []object{}, channels: []object{}, sources: map[int64][]source{}, channelSources: map[string][]source{}, conflicts: []int64{}, channelConflicts: []string{}}
+	c := catalog{services: []object{}, programs: []object{}, channels: []object{}, sources: map[int64][]source{}, channelSources: map[string][]source{}, conflicts: []int64{}, channelConflicts: []channelConflict{}}
+	fresh := make([]bool, len(g.backends))
 	for i, b := range g.backends {
 		if b.updated.IsZero() || now.Sub(b.updated) > time.Duration(g.config.MaxStaleSeconds)*time.Second {
 			continue
 		}
+		fresh[i] = true
 		for _, s := range b.services {
 			id := number(s, "id")
 			c.sources[id] = append(c.sources[id], source{i, s})
@@ -326,7 +337,7 @@ func (g *Gateway) snapshot(now time.Time) catalog {
 	}
 	entries := []channelEntry{}
 	authority := map[int64]int{}
-	seenChannelSource := map[string]bool{}
+	identityConflict := map[int64]bool{}
 	for id, sources := range c.sources {
 		domain := serviceDomain(g.backends[sources[0].backend].config)
 		conflict := false
@@ -339,22 +350,11 @@ func (g *Gateway) snapshot(now time.Time) catalog {
 		}
 		if conflict {
 			c.conflicts = append(c.conflicts, id)
+			identityConflict[id] = true
 			delete(c.sources, id)
 			continue
 		}
 		g.sortSources(sources)
-		// Every source's physical channel is a possible channel stream target.
-		for _, src := range sources {
-			upstream := channelOf(src.service)
-			typ, upstreamName := fmt.Sprint(upstream["type"]), fmt.Sprint(upstream["channel"])
-			key := typ + "/" + g.channelName(g.backends[src.backend].config, upstreamName)
-			dedupe := fmt.Sprint(key, "\x00", src.backend, "\x00", typ, "\x00", upstreamName)
-			if seenChannelSource[dedupe] {
-				continue
-			}
-			seenChannelSource[dedupe] = true
-			c.channelSources[key] = append(c.channelSources[key], src)
-		}
 		a := sources[0]
 		authority[id] = a.backend
 		s := clone(a.service)
@@ -363,7 +363,7 @@ func (g *Gateway) snapshot(now time.Time) catalog {
 		c.services = append(c.services, s)
 		summary := clone(s)
 		delete(summary, "channel")
-		entries = append(entries, channelEntry{key: fmt.Sprint(ch["type"], "/", ch["channel"]), domain: serviceDomain(g.backends[a.backend].config), backend: a.backend, channel: ch, service: summary})
+		entries = append(entries, channelEntry{key: fmt.Sprint(ch["type"], "/", ch["channel"]), domain: serviceDomain(g.backends[a.backend].config), channel: ch, service: summary})
 	}
 	for i, b := range g.backends {
 		for _, p := range b.programs {
@@ -373,13 +373,42 @@ func (g *Gateway) snapshot(now time.Time) catalog {
 			}
 		}
 	}
-	// A shared channel name means one broadcast: configured priority (not health)
-	// picks it, and only sources with the same identity domain may fail over.
-	// Distinct networkIds under one name are different broadcasts, so they lose
-	// failover entirely instead of switching to another station later.
+	// Channel grouping includes every backend that ever synced, even past
+	// max_stale_seconds: forgetting an expired backend would let the surviving
+	// source of a conflicting name switch broadcasts.
+	allSources := map[int64][]source{}
+	for i, b := range g.backends {
+		if b.updated.IsZero() {
+			continue
+		}
+		for _, s := range b.services {
+			if id := number(s, "id"); !identityConflict[id] {
+				allSources[id] = append(allSources[id], source{i, s})
+			}
+		}
+	}
+	grouped := map[string][]source{}
+	seenChannelSource := map[string]bool{}
+	for _, sources := range allSources {
+		for _, src := range sources {
+			upstream := channelOf(src.service)
+			typ, upstreamName := fmt.Sprint(upstream["type"]), fmt.Sprint(upstream["channel"])
+			key := typ + "/" + g.channelName(g.backends[src.backend].config, upstreamName)
+			dedupe := fmt.Sprint(key, "\x00", src.backend, "\x00", typ, "\x00", upstreamName)
+			if seenChannelSource[dedupe] {
+				continue
+			}
+			seenChannelSource[dedupe] = true
+			grouped[key] = append(grouped[key], src)
+		}
+	}
+	// A shared channel name means one broadcast: configured priority (not health
+	// or freshness) picks it, and only sources with the same identity domain may
+	// fail over. Distinct networkIds under one name are different broadcasts, so
+	// only the winner's networkId sources are kept.
 	channelDomain := map[string]string{}
-	channelBackend := map[string]int{}
-	for key, sources := range c.channelSources {
+	channelNetworkID := map[string]int64{}
+	for key, sources := range grouped {
 		best := sources[0]
 		for _, s := range sources[1:] {
 			a, b := g.backends[s.backend].config, g.backends[best.backend].config
@@ -388,32 +417,35 @@ func (g *Gateway) snapshot(now time.Time) catalog {
 			}
 		}
 		domain := serviceDomain(g.backends[best.backend].config)
-		kept := sources[:0]
+		sameDomain := []source{}
 		for _, s := range sources {
 			if serviceDomain(g.backends[s.backend].config) == domain {
-				kept = append(kept, s)
+				sameDomain = append(sameDomain, s)
 			}
 		}
-		g.sortSources(kept)
-		if len(kept) > 1 {
-			networkID := number(kept[0].service, "networkId")
-			for _, s := range kept[1:] {
-				if number(s.service, "networkId") == networkID {
-					continue
+		winnerNetworkID := number(best.service, "networkId")
+		conflict := false
+		if g.config.ChannelNames == "upstream" {
+			for _, s := range sameDomain {
+				if number(s.service, "networkId") != winnerNetworkID {
+					conflict = true
+					break
 				}
-				c.channelConflicts = append(c.channelConflicts, key)
-				kept = nil
-				for _, s := range sources {
-					if s.backend == best.backend {
-						kept = append(kept, s)
-					}
-				}
-				g.sortSources(kept)
-				channelBackend[key] = best.backend
-				break
 			}
 		}
-		c.channelSources[key] = kept
+		if conflict {
+			c.channelConflicts = append(c.channelConflicts, g.describeChannelConflict(key, best.backend, sameDomain))
+			channelNetworkID[key] = winnerNetworkID
+		}
+		serving := []source{}
+		for _, s := range sameDomain {
+			if !fresh[s.backend] || (conflict && number(s.service, "networkId") != winnerNetworkID) {
+				continue
+			}
+			serving = append(serving, s)
+		}
+		g.sortSources(serving)
+		c.channelSources[key] = serving
 		channelDomain[key] = domain
 	}
 	channels := map[string]object{}
@@ -421,7 +453,7 @@ func (g *Gateway) snapshot(now time.Time) catalog {
 		if e.domain != channelDomain[e.key] {
 			continue
 		}
-		if backend, ok := channelBackend[e.key]; ok && e.backend != backend {
+		if networkID, ok := channelNetworkID[e.key]; ok && number(e.service, "networkId") != networkID {
 			continue
 		}
 		if channels[e.key] == nil {
@@ -437,11 +469,29 @@ func (g *Gateway) snapshot(now time.Time) catalog {
 	sortObjects(c.services)
 	sortObjects(c.programs)
 	sort.Slice(c.conflicts, func(i, j int) bool { return c.conflicts[i] < c.conflicts[j] })
-	sort.Strings(c.channelConflicts)
+	sort.Slice(c.channelConflicts, func(i, j int) bool { return c.channelConflicts[i].key < c.channelConflicts[j].key })
 	sort.Slice(c.channels, func(i, j int) bool {
 		return fmt.Sprint(c.channels[i]["type"], c.channels[i]["channel"]) < fmt.Sprint(c.channels[j]["type"], c.channels[j]["channel"])
 	})
 	return c
+}
+
+// describeChannelConflict names the priority winner and each backend's networkId for the log.
+func (g *Gateway) describeChannelConflict(key string, winner int, sources []source) channelConflict {
+	networkIDs := map[string]int64{}
+	for _, s := range sources {
+		networkIDs[g.backends[s.backend].config.ID] = number(s.service, "networkId")
+	}
+	ids := make([]string, 0, len(networkIDs))
+	for id := range networkIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, fmt.Sprintf("%s=%d", id, networkIDs[id]))
+	}
+	return channelConflict{key: key, detail: fmt.Sprintf("%s (winner %s, networkIds %s)", key, g.backends[winner].config.ID, strings.Join(parts, ", "))}
 }
 func sortObjects(items []object) {
 	sort.Slice(items, func(i, j int) bool { return number(items[i], "id") < number(items[j], "id") })

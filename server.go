@@ -292,8 +292,12 @@ func (g *Gateway) health(w http.ResponseWriter) {
 	if available == 0 || len(cat.conflicts) > 0 || len(cat.channelConflicts) > 0 {
 		status = 503
 	}
+	channelConflicts := make([]string, 0, len(cat.channelConflicts))
+	for _, conflict := range cat.channelConflicts {
+		channelConflicts = append(channelConflicts, conflict.key)
+	}
 	g.mu.RUnlock()
-	respond(w, status, object{"ready": status == 200, "degraded": available < len(g.backends), "backends": states, "conflicting_service_ids": cat.conflicts, "conflicting_channels": cat.channelConflicts})
+	respond(w, status, object{"ready": status == 200, "degraded": available < len(g.backends), "backends": states, "conflicting_service_ids": cat.conflicts, "conflicting_channels": channelConflicts})
 }
 
 // streamOptions is the validated per-request stream identity, parsed once.

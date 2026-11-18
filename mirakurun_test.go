@@ -7,7 +7,47 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+type healthResponse struct {
+	Ready            bool     `json:"ready"`
+	ServiceConflicts []int64  `json:"conflicting_service_ids"`
+	ChannelConflicts []string `json:"conflicting_channels"`
+}
+
+// sharedDomainGateway builds a gateway with one service_domain and descending
+// priorities (IDs a, b, c) so channel-name collisions are exercised.
+func sharedDomainGateway(t *testing.T, names string, fs ...*fakeBackend) (*Gateway, *httptest.Server) {
+	t.Helper()
+	c := Config{ChannelNames: names, Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 1}
+	ids := []string{"a", "b", "c"}
+	if len(fs) > len(ids) {
+		t.Fatalf("too many backends")
+	}
+	for i, f := range fs {
+		c.Backends = append(c.Backends, BackendConfig{ID: ids[i], URL: f.server.URL + "/api", Priority: 100 - 10*i, ServiceDomain: "same"})
+	}
+	g, err := NewGateway(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Sync(context.Background())
+	s := httptest.NewServer(g)
+	t.Cleanup(s.Close)
+	return g, s
+}
+
+// setNetworkID rewrites the fake's only service and program to report networkID.
+func setNetworkID(f *fakeBackend, networkID int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	svc, prog := clone(f.services[0]), clone(f.programs[0])
+	id := networkID*100000 + 101
+	svc["networkId"], svc["id"] = networkID, id
+	prog["networkId"], prog["id"] = networkID, id*100000+3
+	f.services, f.programs = []object{svc}, []object{prog}
+}
 
 func configGateway(t *testing.T, c Config, fs ...*fakeBackend) (*Gateway, *httptest.Server) {
 	t.Helper()
@@ -285,6 +325,161 @@ func TestSameDomainChannelNameDifferentNetworkIdConflicts(t *testing.T) {
 	if resp.StatusCode != 503 || b.streamCalls.Load() != 0 {
 		t.Fatalf("fell over to another broadcast: %d", resp.StatusCode)
 	}
+}
+
+func TestChannelConflictSurvivesExpiredWinner(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
+	g, s := sharedDomainGateway(t, "upstream", a, b)
+	var h healthResponse
+	getJSON(t, s.URL+"/healthz", 503, &h)
+	if len(h.ChannelConflicts) != 1 || h.ChannelConflicts[0] != "GR/27" {
+		t.Fatalf("conflict not reported: %+v", h)
+	}
+
+	// The winner expires without a sync; the conflict must not be forgotten.
+	g.mu.Lock()
+	g.backends[0].updated = time.Now().Add(-2 * time.Minute)
+	g.mu.Unlock()
+	getJSON(t, s.URL+"/healthz", 503, &h)
+	if len(h.ChannelConflicts) != 1 || h.ChannelConflicts[0] != "GR/27" {
+		t.Fatalf("expired winner dropped the conflict: %+v", h)
+	}
+
+	req, _ := http.NewRequest("HEAD", s.URL+"/api/channels/GR/27/stream", nil)
+	resp, err := testClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("served another broadcast after the winner expired: %d", resp.StatusCode)
+	}
+	if b.streamCalls.Load() != 0 {
+		t.Fatal("allocated the other broadcast's tuner")
+	}
+}
+
+func TestChannelConflictKeepsSameBroadcastBackup(t *testing.T) {
+	a, b, c := newFake(t, 10, "A"), newFake(t, 10, "B"), newFake(t, 20, "C")
+	g, s := sharedDomainGateway(t, "upstream", a, b, c)
+
+	a.mu.Lock()
+	a.down = true
+	a.mu.Unlock()
+	g.Sync(context.Background())
+
+	resp, err := testClient.Get(s.URL + "/api/channels/GR/27/stream?decode=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		t.Fatalf("same-broadcast backup was dropped: %d", resp.StatusCode)
+	}
+	if body := readStreamBody(t, resp); body != "transport-stream" {
+		t.Fatalf("bad body %q", body)
+	}
+	<-b.started
+	resp.Body.Close()
+	if c.streamCalls.Load() != 0 {
+		t.Fatal("fell over to another broadcast")
+	}
+}
+
+func TestChannelConflictKeepsChannelsWhenWinnerUnhealthy(t *testing.T) {
+	a, b, c := newFake(t, 10, "A"), newFake(t, 10, "B"), newFake(t, 20, "C")
+	g, s := sharedDomainGateway(t, "upstream", a, b, c)
+
+	// The priority winner keeps a fresh catalog but fails its last sync.
+	a.mu.Lock()
+	a.failServices = 503
+	a.mu.Unlock()
+	g.Sync(context.Background())
+
+	var h healthResponse
+	getJSON(t, s.URL+"/healthz", 503, &h)
+	if len(h.ChannelConflicts) != 1 || h.ChannelConflicts[0] != "GR/27" {
+		t.Fatalf("conflict lost: %+v", h)
+	}
+	var channels []object
+	getJSON(t, s.URL+"/api/channels", 200, &channels)
+	if len(channels) != 1 || channels[0]["channel"] != "27" {
+		t.Fatalf("conflicting channel disappeared: %v", channels)
+	}
+	services := channels[0]["services"].([]any)
+	if len(services) != 1 || number(object(services[0].(map[string]any)), "networkId") != 10 {
+		t.Fatalf("channel lists the wrong broadcast: %v", services)
+	}
+
+	req, _ := http.NewRequest("HEAD", s.URL+"/api/channels/GR/27/stream", nil)
+	resp, err := testClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 || c.streamCalls.Load() != 0 {
+		t.Fatalf("channel unusable while a same-broadcast backup is up: %d", resp.StatusCode)
+	}
+}
+
+func TestChannelConflictSourcesAreNotDuplicated(t *testing.T) {
+	a, b, c := newFake(t, 10, "A"), newFake(t, 20, "B"), newFake(t, 30, "C")
+	g, _ := sharedDomainGateway(t, "upstream", a, b, c)
+	g.mu.Lock()
+	g.backends[1].config.ServiceDomain = "other"
+	g.mu.Unlock()
+	g.Sync(context.Background())
+
+	// Map iteration order varies per call; a stale alias would duplicate a source.
+	for i := 0; i < 20; i++ {
+		g.mu.RLock()
+		cat := g.snapshot(time.Now())
+		g.mu.RUnlock()
+		if len(cat.channelConflicts) != 1 {
+			t.Fatalf("pass %d: conflicts %v", i, cat.channelConflicts)
+		}
+		sources := cat.channelSources["GR/27"]
+		if len(sources) != 1 || sources[0].backend != 0 {
+			t.Fatalf("pass %d: conflicting channel sources %v", i, sources)
+		}
+	}
+}
+
+func TestVirtualChannelNamesDoNotReportConflicts(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
+	_, s := sharedDomainGateway(t, "virtual", a, b)
+	var h healthResponse
+	getJSON(t, s.URL+"/healthz", 200, &h)
+	if !h.Ready || len(h.ChannelConflicts) != 0 {
+		t.Fatalf("virtual names reported a conflict: %+v", h)
+	}
+}
+
+func TestChannelConflictResolvesWhenBroadcastMatches(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
+	g, s := sharedDomainGateway(t, "upstream", a, b)
+	var h healthResponse
+	getJSON(t, s.URL+"/healthz", 503, &h)
+	if len(h.ChannelConflicts) != 1 {
+		t.Fatalf("conflict not reported: %+v", h)
+	}
+
+	setNetworkID(b, 10)
+	g.Sync(context.Background())
+	getJSON(t, s.URL+"/healthz", 200, &h)
+	if !h.Ready || len(h.ChannelConflicts) != 0 {
+		t.Fatalf("conflict not resolved: %+v", h)
+	}
+
+	resp, err := testClient.Get(s.URL + "/api/channels/GR/27/stream?decode=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readStreamBody(t, resp); body != "transport-stream" {
+		t.Fatalf("bad body %q", body)
+	}
+	<-a.started
+	resp.Body.Close()
 }
 
 func TestEventsStreamKeepsConnectionOpen(t *testing.T) {

@@ -118,7 +118,7 @@
             "$ref": "#/components/schemas/HealthBackend"
           "type": "array"
         "conflicting_channels":
-          "description": "Exposed channel keys (type/channel) whose upstream sources disagree on networkId. Only the highest-priority backend's sources are used for these channels."
+          "description": "Exposed channel keys (type/channel) whose upstream sources disagree on networkId. Only sources with the priority winner's networkId are used for these channels, so a stale winner never fails over to another broadcast. 503 when non-empty."
           "items":
             "type": "string"
           "type": "array"
@@ -350,7 +350,7 @@
         - "Monitoring"
   "/api/channels":
     "get":
-      "description": "Channels from the merged catalog. With the default virtual names each channel is scoped to a backend; with upstream names, backends that share a name are collapsed to the configured-priority winner. When those sources disagree on networkId, only the highest-priority backend's services are listed. Channel detail is unsupported."
+      "description": "Channels from the merged catalog. With the default virtual names each channel is scoped to a backend; with upstream names, backends that share a name are collapsed to the configured-priority winner. When those sources disagree on networkId, only services with the winner's networkId are listed. Channel detail is unsupported."
       "responses":
         "200":
           "content":
@@ -391,7 +391,7 @@
         - "Catalog"
   "/api/channels/{type}/{channel}/stream":
     "get":
-      "description": "Whole-transponder MPEG-TS from the preferred backend for this channel. Channel names follow channel_names (virtual by default, upstream for Mirakurun-compatible clients). With upstream names, configured priority picks the broadcast for a shared name, and only sources with the same service domain fail over. Sources that disagree on networkId are different broadcasts: only the highest-priority backend's sources are kept and failover is disabled. Sharing otherwise matches service streams; priority does not split groups and decode=0 may join a decoded stream."
+      "description": "Whole-transponder MPEG-TS from the preferred backend for this channel. Channel names follow channel_names (virtual by default, upstream for Mirakurun-compatible clients). With upstream names, configured priority (not health or freshness) picks the broadcast for a shared name, and only sources with the same service domain fail over. Sources that disagree on networkId are different broadcasts: only sources with the winner's networkId are kept, including stale catalogs, so an unavailable winner never switches to another broadcast. Sharing otherwise matches service streams; priority does not split groups and decode=0 may join a decoded stream."
       "parameters":
         -
           "description": "Broadcast type: GR, BS, CS or SKY"
