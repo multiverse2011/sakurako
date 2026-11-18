@@ -13,13 +13,10 @@ import (
 	"time"
 )
 
-// tuners aggregates live tuner state. Unlike catalog endpoints it cannot use a
-// snapshot: Mirakurun clients use it to see who holds each tuner right now.
-// Backends are queried in parallel so one slow backend does not use up the whole
-// timeout, and a failed backend is logged instead of failing the response.
-// Only when every backend fails is the response a 503.
-func (g *Gateway) tuners(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(g.config.CatalogTimeoutSeconds)*time.Second)
+// fetchTuners queries every backend in parallel, so one slow backend does not
+// use up the whole timeout. Err entries stay aligned with the backend index.
+func (g *Gateway) fetchTuners(parent context.Context) ([][]object, []error) {
+	ctx, cancel := context.WithTimeout(parent, time.Duration(g.config.CatalogTimeoutSeconds)*time.Second)
 	defer cancel()
 	g.mu.RLock()
 	backends := append([]backend(nil), g.backends...)
@@ -35,6 +32,15 @@ func (g *Gateway) tuners(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 	wg.Wait()
+	return lists, errs
+}
+
+// tuners aggregates live tuner state. Unlike catalog endpoints it cannot use a
+// snapshot: Mirakurun clients use it to see who holds each tuner right now.
+// A failed backend is logged instead of failing the response; only when every
+// backend fails is the response a 503.
+func (g *Gateway) tuners(w http.ResponseWriter, r *http.Request) {
+	lists, errs := g.fetchTuners(r.Context())
 	// A disconnected client is not a backend failure; Sync skips shutdown
 	// cancellations the same way.
 	if r.Context().Err() != nil {

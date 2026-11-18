@@ -73,7 +73,7 @@ func TestUIStateStartingAndSharedClients(t *testing.T) {
 
 func TestUIRoutesAndMethodPolicy(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"))
-	for _, path := range []string{"/ui/", "/ui/style.css", "/ui/app.js", "/ui/favicon.svg", "/-/ui/state", "/-/ui/config", "/-/ui/logs"} {
+	for _, path := range []string{"/ui/", "/ui/style.css", "/ui/app.js", "/ui/favicon.svg", "/-/ui/state", "/-/ui/tuners", "/-/ui/config", "/-/ui/logs"} {
 		recorder := httptest.NewRecorder()
 		g.ServeHTTP(recorder, httptest.NewRequest("GET", path, nil))
 		if recorder.Code != 200 {
@@ -97,6 +97,63 @@ func TestUIRoutesAndMethodPolicy(t *testing.T) {
 	g.ServeHTTP(r, httptest.NewRequest(http.MethodHead, "/ui/", nil))
 	if r.Body.Len() != 0 {
 		t.Fatal("HEAD served body")
+	}
+}
+
+func TestUITunerCounts(t *testing.T) {
+	free := object{"index": 1, "isAvailable": true, "isFault": false, "users": []object{}}
+	busy := object{"index": 2, "isAvailable": true, "isFault": false, "users": []object{{"id": "u1"}}}
+	faulty := object{"index": 3, "isAvailable": false, "isFault": true, "users": []object{}}
+	a, b := newFake(t, 10, "primary"), newFake(t, 10, "backup")
+	a.tuners = []object{free, busy}
+	b.tuners = []object{faulty, busy}
+	_, s := gateway(t, a, b)
+
+	var got struct {
+		Available bool `json:"available"`
+		InUse     int  `json:"in_use"`
+		Total     int  `json:"total"`
+		Free      int  `json:"free"`
+		Fault     int  `json:"fault"`
+		Backends  []struct {
+			ID    string `json:"id"`
+			InUse int    `json:"in_use"`
+			Total int    `json:"total"`
+			Free  int    `json:"free"`
+			Fault int    `json:"fault"`
+		} `json:"backends"`
+	}
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if !got.Available || got.InUse != 2 || got.Total != 4 || got.Free != 2 || got.Fault != 1 {
+		t.Fatalf("totals: %+v", got)
+	}
+	if len(got.Backends) != 2 || got.Backends[0].InUse != 1 || got.Backends[0].Free != 1 || got.Backends[1].Fault != 1 {
+		t.Fatalf("backend breakdown: %+v", got.Backends)
+	}
+
+	// One broken backend only drops its own row; the screen keeps the rest.
+	b.mu.Lock()
+	b.failTuners = 500
+	b.mu.Unlock()
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if !got.Available || len(got.Backends) != 1 || got.Backends[0].ID != "region0" || got.Total != 2 || got.Fault != 0 {
+		t.Fatalf("partial failure: %+v", got)
+	}
+
+	a.mu.Lock()
+	a.failTuners = 500
+	a.mu.Unlock()
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if got.Available || len(got.Backends) != 0 || got.Total != 0 {
+		t.Fatalf("all failed should still answer 200 and say unavailable: %+v", got)
+	}
+}
+
+func TestCountTunersIsUsing(t *testing.T) {
+	// Mirakurun may report allocation only through isUsing.
+	inUse, total, fault := countTuners([]object{{"isUsing": true}, {"isAvailable": true}})
+	if inUse != 1 || total != 2 || fault != 0 {
+		t.Fatalf("countTuners: %d %d %d", inUse, total, fault)
 	}
 }
 
