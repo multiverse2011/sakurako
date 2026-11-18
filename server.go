@@ -49,10 +49,12 @@ func NewGateway(c Config) (*Gateway, error) {
 	// Redirects could change backend identity or leak stream options to another host.
 	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	// Event subscriptions are idle for minutes at a time, so they cannot use the
-	// stream transport's per-read idle deadline; only a silent backend is bounded.
+	// stream transport's per-read idle deadline; only the wait for response
+	// headers is bounded.
 	eventsTransport := http.DefaultTransport.(*http.Transport).Clone()
 	eventsTransport.ResponseHeaderTimeout = timeout
 	eventsTransport.DisableCompression = true
+	eventsTransport.MaxResponseHeaderBytes = 64 << 10
 	g := &Gateway{config: c, catalogClient: &http.Client{Timeout: time.Duration(c.CatalogTimeoutSeconds) * time.Second, CheckRedirect: noRedirect}, streamClient: &http.Client{Transport: transport, CheckRedirect: noRedirect}, eventsClient: &http.Client{Transport: eventsTransport, CheckRedirect: noRedirect}}
 	// Copy so later changes to the caller's slice cannot desync the gateway.
 	g.config.Backends = append([]BackendConfig(nil), c.Backends...)

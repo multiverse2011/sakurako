@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -81,6 +82,12 @@ func (g *Gateway) exposeTuner(t object, index int) {
 	}
 }
 
+// Tuner event timings, as package variables so tests can shorten them.
+var (
+	tunerEventKeepalive = 15 * time.Second
+	tunerEventRetry     = 5 * time.Second
+)
+
 // events relays tuner events from every backend to one client, in Mirakurun's
 // format: an application/json response holding an unclosed array. Each client
 // keeps its own upstream subscriptions, which end when the client disconnects.
@@ -97,31 +104,34 @@ func (g *Gateway) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	controller := http.NewResponseController(w)
-	// Override the server-wide WriteTimeout; the stream must outlive it.
-	refresh := func() error { return controller.SetWriteDeadline(time.Now().Add(30 * time.Second)) }
-	if err := refresh(); err != nil {
-		log.Printf("events: stream setup failed: %v", err)
-		return
+	// Override the server-wide WriteTimeout. A write deadline only affects writes,
+	// so an idle response survives it; refreshing just before each write is enough.
+	write := func(s string) bool {
+		if err := controller.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			log.Printf("events: write deadline failed: %v", err)
+			return false
+		}
+		if _, err := io.WriteString(w, s); err != nil {
+			return false
+		}
+		return controller.Flush() == nil
 	}
-	if _, err := io.WriteString(w, "[\n"); err != nil {
-		return
-	}
-	if err := controller.Flush(); err != nil {
-		log.Printf("events: stream setup failed: %v", err)
+	if !write("[\n") {
 		return
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	out := make(chan object) // unbuffered: a slow client backpressures its subscriptions
+	var live atomic.Int32    // established upstream subscriptions
 	var wg sync.WaitGroup
 	defer func() { cancel(); wg.Wait() }() // no subscription outlives its client
 	for i := range g.backends {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
-			g.relayTunerEvents(ctx, index, out)
+			g.relayTunerEvents(ctx, index, out, &live)
 		}(i)
 	}
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(tunerEventKeepalive)
 	defer ticker.Stop()
 	for {
 		select {
@@ -133,26 +143,14 @@ func (g *Gateway) events(w http.ResponseWriter, r *http.Request) {
 				log.Printf("events: %v", err)
 				continue
 			}
-			if err := refresh(); err != nil {
-				log.Printf("events: write deadline failed: %v", err)
-				return
-			}
-			if _, err := w.Write(append(data, '\n', ',', '\n')); err != nil {
-				return
-			}
-			if err := controller.Flush(); err != nil {
+			if !write(string(append(data, '\n', ',', '\n'))) {
 				return
 			}
 		case <-ticker.C:
-			if err := refresh(); err != nil {
-				log.Printf("events: keepalive deadline failed: %v", err)
-				return
-			}
-			// Whitespace keeps proxies and clients awake without disturbing the array.
-			if _, err := io.WriteString(w, "\n"); err != nil {
-				return
-			}
-			if err := controller.Flush(); err != nil {
+			// Mirakurun never writes while connected. Keepalive only bridges a
+			// subscription that is down, so byte-driven clients such as the denpa
+			// bridge do not re-read /api/tuners while nothing is happening.
+			if live.Load() != int32(len(g.backends)) && !write("\n") {
 				return
 			}
 		}
@@ -161,24 +159,24 @@ func (g *Gateway) events(w http.ResponseWriter, r *http.Request) {
 
 // relayTunerEvents subscribes to one backend until ctx ends, reconnecting after
 // failures so a restarted backend is picked up again.
-func (g *Gateway) relayTunerEvents(ctx context.Context, index int, out chan<- object) {
+func (g *Gateway) relayTunerEvents(ctx context.Context, index int, out chan<- object, live *atomic.Int32) {
 	for {
-		err := g.followTunerEvents(ctx, index, out)
+		err := g.followTunerEvents(ctx, index, out, live)
 		if ctx.Err() != nil {
 			return
 		}
-		log.Printf("events: %s: %v (reconnecting in 5s)", g.backends[index].config.ID, err)
+		log.Printf("events: %s: %v (reconnecting in %v)", g.backends[index].config.ID, err, tunerEventRetry)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
+		case <-time.After(tunerEventRetry):
 		}
 	}
 }
 
 // followTunerEvents reads Mirakurun's JSON array one event at a time and rewrites
 // tuner data exactly like /api/tuners before handing it on.
-func (g *Gateway) followTunerEvents(ctx context.Context, index int, out chan<- object) error {
+func (g *Gateway) followTunerEvents(ctx context.Context, index int, out chan<- object, live *atomic.Int32) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL(g.backends[index].base, "/events/stream", "resource=tuner"), nil)
 	if err != nil {
 		return err
@@ -194,9 +192,13 @@ func (g *Gateway) followTunerEvents(ctx context.Context, index int, out chan<- o
 	}
 	dec := json.NewDecoder(resp.Body)
 	dec.UseNumber()
-	if _, err := dec.Token(); err != nil { // opening '['
+	if tok, err := dec.Token(); err != nil {
 		return err
+	} else if tok != json.Delim('[') {
+		return fmt.Errorf("not an event stream: starts with %v", tok)
 	}
+	live.Add(1)
+	defer live.Add(-1)
 	for {
 		var e object
 		if err := dec.Decode(&e); err != nil {

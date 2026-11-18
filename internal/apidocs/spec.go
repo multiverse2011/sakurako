@@ -252,7 +252,7 @@ func endpoints() []endpoint {
 			tags: monitoring,
 			get: operation{
 				summary:     "Tuner event stream",
-				description: "Tuner events relayed from every backend in Mirakurun's format: an unclosed JSON array of {resource, type, data, time} objects. Tuner data is rewritten like /api/tuners. Tuner changes arrive as they happen; a newline keepalive is written every 15 seconds. Cache-Control: no-store.",
+				description: "Tuner events relayed from every backend in Mirakurun's format: an unclosed JSON array of {resource, type, data, time} objects. Tuner data is rewritten like /api/tuners. Tuner changes arrive as they happen; only while a backend subscription is down is a newline keepalive written every 15 seconds. Cache-Control: no-store.",
 				parameters:  []any{object{"name": "resource", "in": "query", "required": true, "schema": object{"type": "string", "enum": []any{"tuner"}}, "description": "Only resource=tuner is supported."}},
 				responses:   getResponses(object{"description": "Event stream; the JSON array stays open and never closes.", "content": object{"application/json": object{"schema": object{"type": "string"}}}}, "400"),
 			},

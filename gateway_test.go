@@ -71,6 +71,7 @@ type fakeBackend struct {
 	stallTuners        bool
 	events             chan object
 	failEvents         int
+	eventTried         chan struct{}
 	eventCanceled      chan struct{}
 }
 
@@ -81,7 +82,7 @@ func fixture(n, s int64, name string) (object, object) {
 func newFake(t *testing.T, n int64, name string) *fakeBackend {
 	t.Helper()
 	s, p := fixture(n, 101, name)
-	f := &fakeBackend{services: []object{s}, programs: []object{p}, started: make(chan http.Header, 10), canceled: make(chan struct{}, 10), eventCanceled: make(chan struct{}, 10)}
+	f := &fakeBackend{services: []object{s}, programs: []object{p}, started: make(chan http.Header, 10), canceled: make(chan struct{}, 10), eventTried: make(chan struct{}, 1), eventCanceled: make(chan struct{}, 10)}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		down, status, stall, end := f.down, f.streamStatus, f.stall, f.end
@@ -92,7 +93,7 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 		failEvents := f.failEvents
 		oversizeServices, oversizePrograms := f.oversizeServices, f.oversizePrograms
 		location, statusFor := f.streamLocation, f.streamStatusFor
-		s, p := f.services, f.programs
+		s, p, events := f.services, f.programs, f.events
 		f.mu.Unlock()
 		if down {
 			http.Error(w, "down", 503)
@@ -134,6 +135,10 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 			}
 			respond(w, 200, p)
 		case "/api/events/stream":
+			select {
+			case f.eventTried <- struct{}{}:
+			default:
+			}
 			if failEvents != 0 {
 				http.Error(w, "events unavailable", failEvents)
 				return
@@ -145,7 +150,7 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 			defer func() { f.eventCanceled <- struct{}{} }()
 			for {
 				select {
-				case e := <-f.events:
+				case e := <-events:
 					b, _ := json.Marshal(e)
 					_, _ = w.Write(append(b, '\n', ','))
 					w.(http.Flusher).Flush()
