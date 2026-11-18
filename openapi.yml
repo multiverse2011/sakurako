@@ -391,7 +391,7 @@
         - "Catalog"
   "/api/channels/{type}/{channel}/stream":
     "get":
-      "description": "Whole-transponder MPEG-TS from the preferred backend for this channel. Channel names follow channel_names (virtual by default, upstream for Mirakurun-compatible clients). With upstream names, configured priority (not health or freshness) picks the broadcast for a shared name, and only sources with the same service domain fail over. Sources that disagree on networkId are different broadcasts: only sources with the winner's networkId are kept, including stale catalogs, so an unavailable winner never switches to another broadcast. Sharing otherwise matches service streams; priority does not split groups and decode=0 may join a decoded stream."
+      "description": "Whole-transponder MPEG-TS from the preferred backend for this channel. Channel names follow channel_names (virtual by default, upstream for Mirakurun-compatible clients). With upstream names, configured priority (not health or freshness) picks the broadcast for a shared name, and only sources with the same service domain fail over. Sources that disagree on networkId are different broadcasts: the winner is chosen including stale catalogs, and only fresh sources with the winner's networkId are served, so an unavailable winner never switches to another broadcast. Sharing otherwise matches service streams; priority does not split groups and decode=0 may join a decoded stream."
       "parameters":
         -
           "description": "Broadcast type: GR, BS, CS or SKY"

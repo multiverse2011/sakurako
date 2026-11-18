@@ -58,8 +58,8 @@ type channelConflict struct {
 	detail string // for logs: winner backend and each backend's networkId
 }
 
-// channelEntry is one service's view of an exposed channel, filtered after the
-// preferred backend for that channel name is known.
+// channelEntry is one service's view of an exposed channel, filtered once the
+// winning domain and networkId for that channel name are known.
 type channelEntry struct {
 	key, domain      string
 	channel, service object
@@ -301,7 +301,7 @@ func (g *Gateway) logChannelConflicts() {
 	previous := g.loggedChannelConflicts
 	g.loggedChannelConflicts = signature
 	if signature != "" {
-		log.Printf("warning: channel name shared by different broadcasts: %s; keeping only the priority winner's networkId sources and no failover", signature)
+		log.Printf("warning: channel name shared by different broadcasts: %s; keeping only the priority winner's networkId sources and no failover to another broadcast", signature)
 	} else if previous != "" {
 		log.Print("channel conflicts resolved")
 	}
@@ -426,6 +426,7 @@ func (g *Gateway) snapshot(now time.Time) catalog {
 		winnerNetworkID := number(best.service, "networkId")
 		conflict := false
 		if g.config.ChannelNames == "upstream" {
+			// Defensive: virtual keys are per backend, so this is not reachable today.
 			for _, s := range sameDomain {
 				if number(s.service, "networkId") != winnerNetworkID {
 					conflict = true

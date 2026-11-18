@@ -345,6 +345,11 @@ func TestChannelConflictSurvivesExpiredWinner(t *testing.T) {
 		t.Fatalf("expired winner dropped the conflict: %+v", h)
 	}
 
+	var channels []object
+	getJSON(t, s.URL+"/api/channels", 200, &channels)
+	if len(channels) != 0 {
+		t.Fatalf("expired winner left the conflicting channel listed: %v", channels)
+	}
 	req, _ := http.NewRequest("HEAD", s.URL+"/api/channels/GR/27/stream", nil)
 	resp, err := testClient.Do(req)
 	if err != nil {
@@ -356,6 +361,76 @@ func TestChannelConflictSurvivesExpiredWinner(t *testing.T) {
 	}
 	if b.streamCalls.Load() != 0 {
 		t.Fatal("allocated the other broadcast's tuner")
+	}
+}
+
+func TestExpiredWinnerFailsOverToSameBroadcast(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 10, "B")
+	g, s := sharedDomainGateway(t, "upstream", a, b)
+
+	g.mu.Lock()
+	g.backends[0].updated = time.Now().Add(-2 * time.Minute)
+	g.mu.Unlock()
+
+	var channels []object
+	getJSON(t, s.URL+"/api/channels", 200, &channels)
+	if len(channels) != 1 || channels[0]["channel"] != "27" {
+		t.Fatalf("same-broadcast channel disappeared: %v", channels)
+	}
+
+	resp, err := testClient.Get(s.URL + "/api/channels/GR/27/stream?decode=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		t.Fatalf("same-broadcast backup was not used: %d", resp.StatusCode)
+	}
+	if body := readStreamBody(t, resp); body != "transport-stream" {
+		t.Fatalf("bad body %q", body)
+	}
+	<-b.started
+	resp.Body.Close()
+
+	var h healthResponse
+	getJSON(t, s.URL+"/healthz", 200, &h)
+	if !h.Ready || len(h.ChannelConflicts) != 0 {
+		t.Fatalf("same broadcast reported as a conflict: %+v", h)
+	}
+}
+
+func TestChannelNameDoesNotFailOverAcrossServiceDomains(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
+	c := Config{ChannelNames: "upstream", Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 1,
+		Backends: []BackendConfig{
+			{ID: "a", URL: a.server.URL + "/api", Priority: 100, ServiceDomain: "region-a"},
+			{ID: "b", URL: b.server.URL + "/api", Priority: 50, ServiceDomain: "region-b"},
+		}}
+	g, err := NewGateway(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Sync(context.Background())
+	s := httptest.NewServer(g)
+	t.Cleanup(s.Close)
+
+	// The priority winner expires; the other domain's same name must not take over.
+	g.mu.Lock()
+	g.backends[0].updated = time.Now().Add(-2 * time.Minute)
+	g.mu.Unlock()
+	var channels []object
+	getJSON(t, s.URL+"/api/channels", 200, &channels)
+	if len(channels) != 0 {
+		t.Fatalf("fell over to another domain's channel: %v", channels)
+	}
+	req, _ := http.NewRequest("HEAD", s.URL+"/api/channels/GR/27/stream", nil)
+	resp, err := testClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == 200 || b.streamCalls.Load() != 0 {
+		t.Fatalf("fell over to another service domain: %d", resp.StatusCode)
 	}
 }
 
@@ -446,6 +521,9 @@ func TestChannelConflictSourcesAreNotDuplicated(t *testing.T) {
 }
 
 func TestVirtualChannelNamesDoNotReportConflicts(t *testing.T) {
+	// Virtual keys are per backend and dedupe collapses a backend's same-name
+	// services, so no conflict can arise here at all. This guards "no conflict
+	// under virtual names"; it does not prove the upstream-only gate.
 	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
 	_, s := sharedDomainGateway(t, "virtual", a, b)
 	var h healthResponse
