@@ -198,7 +198,8 @@ func TestSharedChannelNameUsesPriorityNotHealth(t *testing.T) {
 }
 
 func TestSameDomainChannelNameFailsOver(t *testing.T) {
-	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
+	// Same networkId: the two backends really carry the same broadcast.
+	a, b := newFake(t, 10, "A"), newFake(t, 10, "B")
 	c := Config{ChannelNames: "upstream", Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 1,
 		Backends: []BackendConfig{
 			{ID: "a", URL: a.server.URL + "/api", Priority: 100, ServiceDomain: "same"},
@@ -211,6 +212,15 @@ func TestSameDomainChannelNameFailsOver(t *testing.T) {
 	g.Sync(context.Background())
 	s := httptest.NewServer(g)
 	t.Cleanup(s.Close)
+
+	var h struct {
+		Ready     bool     `json:"ready"`
+		Conflicts []string `json:"conflicting_channels"`
+	}
+	getJSON(t, s.URL+"/healthz", 200, &h)
+	if !h.Ready || len(h.Conflicts) != 0 {
+		t.Fatalf("same networkId reported as a conflict: %+v", h)
+	}
 
 	a.mu.Lock()
 	a.down = true
@@ -226,6 +236,55 @@ func TestSameDomainChannelNameFailsOver(t *testing.T) {
 	}
 	<-b.started
 	resp.Body.Close()
+}
+
+func TestSameDomainChannelNameDifferentNetworkIdConflicts(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
+	c := Config{ChannelNames: "upstream", Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 1,
+		Backends: []BackendConfig{
+			{ID: "a", URL: a.server.URL + "/api", Priority: 100, ServiceDomain: "same"},
+			{ID: "b", URL: b.server.URL + "/api", Priority: 50, ServiceDomain: "same"},
+		}}
+	g, err := NewGateway(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Sync(context.Background())
+	s := httptest.NewServer(g)
+	t.Cleanup(s.Close)
+
+	var h struct {
+		Ready     bool     `json:"ready"`
+		Conflicts []string `json:"conflicting_channels"`
+	}
+	getJSON(t, s.URL+"/healthz", 503, &h)
+	if h.Ready || len(h.Conflicts) != 1 || h.Conflicts[0] != "GR/27" {
+		t.Fatalf("health did not report the channel conflict: %+v", h)
+	}
+	var channels []object
+	getJSON(t, s.URL+"/api/channels", 200, &channels)
+	if len(channels) != 1 {
+		t.Fatalf("got %d channels", len(channels))
+	}
+	services := channels[0]["services"].([]any)
+	if len(services) != 1 || number(object(services[0].(map[string]any)), "networkId") != 10 {
+		t.Fatalf("channel lists the wrong broadcast: %v", services)
+	}
+
+	a.mu.Lock()
+	a.down = true
+	a.mu.Unlock()
+	g.Sync(context.Background())
+
+	req, _ := http.NewRequest("HEAD", s.URL+"/api/channels/GR/27/stream", nil)
+	resp, err := testClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 503 || b.streamCalls.Load() != 0 {
+		t.Fatalf("fell over to another broadcast: %d", resp.StatusCode)
+	}
 }
 
 func TestEventsStreamKeepsConnectionOpen(t *testing.T) {

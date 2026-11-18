@@ -71,6 +71,8 @@ docker compose up -d
 
 `max_stale_seconds` は `sync_seconds + catalog_timeout_seconds` 以上にします。[設定例](sakurako.example.json)も参照してください。
 
+`channel_names` に `upstream` を指定すると、接続先が違っても同じ名前のチャンネルは 1 つにまとまります。同じ `service_domain` を設定した接続先どうしで、同じ名前のチャンネルが別の放送（`networkId` が異なる）を指している場合、そのチャンネルは優先度が最も高い接続先からのみ配信し、予備の接続先へは切り替えません。この競合は `/healthz` の `conflicting_channels` とログに表示されます。同じ放送を冗長化するときは、`service_domain` を揃えるだけでなく、各接続先が同じ `networkId` の放送を受信していることを確認してください。
+
 ## 仕組み
 
 - **情報の集約**：各 Mirakurun のサービス・番組情報を定期的に取得します。チャンネル名は `tokyo-3237` のように接続先ごとに区別します。

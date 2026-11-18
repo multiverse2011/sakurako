@@ -289,11 +289,11 @@ func (g *Gateway) health(w http.ResponseWriter) {
 		states = append(states, object{"id": b.config.ID, "healthy": usable, "catalog_available": fresh, "last_success": nilIfZero(b.updated), "error": errCategory, "stream_retry_after": nilIfExpired(now, b.blockedUntil)})
 	}
 	status := 200
-	if available == 0 || len(cat.conflicts) > 0 {
+	if available == 0 || len(cat.conflicts) > 0 || len(cat.channelConflicts) > 0 {
 		status = 503
 	}
 	g.mu.RUnlock()
-	respond(w, status, object{"ready": status == 200, "degraded": available < len(g.backends), "backends": states, "conflicting_service_ids": cat.conflicts})
+	respond(w, status, object{"ready": status == 200, "degraded": available < len(g.backends), "backends": states, "conflicting_service_ids": cat.conflicts, "conflicting_channels": cat.channelConflicts})
 }
 
 // streamOptions is the validated per-request stream identity, parsed once.
