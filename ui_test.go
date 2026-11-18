@@ -118,6 +118,20 @@ func TestUIServiceTypeSurvivesVirtualChannel(t *testing.T) {
 	}
 }
 
+func TestUIServicesFilterControls(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "regional service"))
+	for _, path := range []string{"/ui/", "/ui/app.js"} {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		body := w.Body.String()
+		for _, needle := range []string{"service-type", "service-backend", "service-sort", "service-count"} {
+			if !strings.Contains(body, needle) {
+				t.Fatalf("%s: missing %s", path, needle)
+			}
+		}
+	}
+}
+
 func TestMirakurunUIURL(t *testing.T) {
 	for input, want := range map[string]string{
 		"http://host:40772/api":   "http://host:40772/",
