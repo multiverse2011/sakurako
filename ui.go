@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"embed"
@@ -19,6 +21,74 @@ import (
 //go:embed ui/*
 var uiFiles embed.FS
 
+// uiAsset is an embedded file with its compressed form. gzipped stays nil when
+// compression does not pay off.
+type uiAsset struct {
+	data, gzipped []byte
+	etag, gzEtag  string
+}
+
+// uiAssets compresses at startup: the Scalar bundle is 4.8 MB, so compressing it
+// per request would cost more than sending it.
+var uiAssets = func() map[string]*uiAsset {
+	assets := map[string]*uiAsset{}
+	for _, name := range []string{"theme.js", "theme.css", "index.html", "style.css", "app.js", "docs.html", "docs.js", "favicon.svg", "vendor/scalar-standalone.js"} {
+		data, err := uiFiles.ReadFile("ui/" + name)
+		if err != nil {
+			panic(err)
+		}
+		asset := &uiAsset{data: data, etag: contentETag(data)}
+		if gzipped := gzipBytes(data); len(gzipped) < len(data) {
+			asset.gzipped, asset.gzEtag = gzipped, contentETag(gzipped)
+		}
+		assets[name] = asset
+	}
+	return assets
+}()
+
+func contentETag(data []byte) string {
+	return fmt.Sprintf(`"%x"`, sha256.Sum256(data))
+}
+
+func gzipBytes(data []byte) []byte {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		panic(err)
+	}
+	if err := zw.Close(); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
+// acceptsGzip parses Accept-Encoding, honoring explicit q=0 exclusions over the
+// wildcard. Shared with API compression so both agree on the header.
+func acceptsGzip(header string) bool {
+	gzipQ, wildcardQ := -1.0, -1.0
+	for _, entry := range strings.Split(header, ",") {
+		fields := strings.Split(strings.TrimSpace(entry), ";")
+		q := 1.0
+		for _, param := range fields[1:] {
+			if value, ok := strings.CutPrefix(strings.TrimSpace(param), "q="); ok {
+				if parsed, err := strconv.ParseFloat(value, 64); err == nil {
+					q = parsed
+				}
+			}
+		}
+		switch strings.ToLower(strings.TrimSpace(fields[0])) {
+		case "gzip", "x-gzip":
+			gzipQ = q
+		case "*":
+			wildcardQ = q
+		}
+	}
+	if gzipQ >= 0 {
+		return gzipQ > 0
+	}
+	return wildcardQ > 0
+}
+
 //go:embed openapi.yml
 var openAPISpec []byte
 
@@ -32,7 +102,7 @@ var openAPIJSON = func() []byte {
 }()
 
 func serveOpenAPI(w http.ResponseWriter, r *http.Request, data []byte, contentType string) {
-	etag := fmt.Sprintf(`"%x"`, sha256.Sum256(data))
+	etag := contentETag(data)
 	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && etagMatches(r.Header.Get("If-None-Match"), etag) {
 		w.Header().Set("ETag", etag)
 		w.Header().Set("Cache-Control", "no-cache")
@@ -112,14 +182,8 @@ func (g *Gateway) serveUI(w http.ResponseWriter, r *http.Request) bool {
 	if name == "" {
 		name = "index.html"
 	}
-	switch name {
-	case "theme.js", "theme.css", "index.html", "style.css", "app.js", "docs.html", "docs.js", "favicon.svg", "vendor/scalar-standalone.js":
-	default:
-		http.NotFound(w, r)
-		return true
-	}
-	data, err := uiFiles.ReadFile("ui/" + name)
-	if err != nil {
+	asset := uiAssets[name]
+	if asset == nil {
 		http.NotFound(w, r)
 		return true
 	}
@@ -141,10 +205,27 @@ func (g *Gateway) serveUI(w http.ResponseWriter, r *http.Request) bool {
 	}
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-cache")
-	if r.Method != "HEAD" {
+	serveUIAsset(w, r, asset)
+	return true
+}
+
+// serveUIAsset picks the identity or gzip representation and revalidates it.
+// Each encoding has its own ETag so a cache never answers with the wrong one.
+func serveUIAsset(w http.ResponseWriter, r *http.Request, asset *uiAsset) {
+	data, etag := asset.data, asset.etag
+	if asset.gzipped != nil && acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		data, etag = asset.gzipped, asset.gzEtag
+		w.Header().Set("Content-Encoding", "gzip")
+	}
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Vary", "Accept-Encoding")
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	if r.Method != http.MethodHead {
 		w.Write(data)
 	}
-	return true
 }
 
 // This is an observational snapshot: catalog and stream state are copied under
