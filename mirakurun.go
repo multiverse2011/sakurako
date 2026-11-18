@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -80,15 +81,15 @@ func (g *Gateway) exposeTuner(t object, index int) {
 	}
 }
 
-// events keeps a Mirakurun client connected. Tuner changes are not pushed:
-// channel-based clients re-read /api/tuners on their own schedule.
-// shortcut: keepalive only, upgrade when instant tuner push is needed.
+// events relays tuner events from every backend to one client, in Mirakurun's
+// format: an application/json response holding an unclosed array. Each client
+// keeps its own upstream subscriptions, which end when the client disconnects.
 func (g *Gateway) events(w http.ResponseWriter, r *http.Request) {
 	if q := r.URL.Query(); len(q) != 1 || len(q["resource"]) != 1 || q["resource"][0] != "tuner" {
 		apiError(w, 400, "only resource=tuner is supported")
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(200)
@@ -96,15 +97,29 @@ func (g *Gateway) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	controller := http.NewResponseController(w)
-	// Override the server-wide WriteTimeout; SSE must outlive it.
+	// Override the server-wide WriteTimeout; the stream must outlive it.
 	refresh := func() error { return controller.SetWriteDeadline(time.Now().Add(30 * time.Second)) }
 	if err := refresh(); err != nil {
-		log.Printf("events: SSE setup failed: %v", err)
+		log.Printf("events: stream setup failed: %v", err)
+		return
+	}
+	if _, err := io.WriteString(w, "[\n"); err != nil {
 		return
 	}
 	if err := controller.Flush(); err != nil {
-		log.Printf("events: SSE setup failed: %v", err)
+		log.Printf("events: stream setup failed: %v", err)
 		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	out := make(chan object) // unbuffered: a slow client backpressures its subscriptions
+	var wg sync.WaitGroup
+	defer func() { cancel(); wg.Wait() }() // no subscription outlives its client
+	for i := range g.backends {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			g.relayTunerEvents(ctx, index, out)
+		}(i)
 	}
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -112,17 +127,88 @@ func (g *Gateway) events(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case <-ticker.C:
+		case e := <-out:
+			data, err := json.Marshal(e)
+			if err != nil {
+				log.Printf("events: %v", err)
+				continue
+			}
 			if err := refresh(); err != nil {
-				log.Printf("events: keepalive deadline failed: %v", err)
+				log.Printf("events: write deadline failed: %v", err)
 				return
 			}
-			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+			if _, err := w.Write(append(data, '\n', ',', '\n')); err != nil {
 				return
 			}
 			if err := controller.Flush(); err != nil {
 				return
 			}
+		case <-ticker.C:
+			if err := refresh(); err != nil {
+				log.Printf("events: keepalive deadline failed: %v", err)
+				return
+			}
+			// Whitespace keeps proxies and clients awake without disturbing the array.
+			if _, err := io.WriteString(w, "\n"); err != nil {
+				return
+			}
+			if err := controller.Flush(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// relayTunerEvents subscribes to one backend until ctx ends, reconnecting after
+// failures so a restarted backend is picked up again.
+func (g *Gateway) relayTunerEvents(ctx context.Context, index int, out chan<- object) {
+	for {
+		err := g.followTunerEvents(ctx, index, out)
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("events: %s: %v (reconnecting in 5s)", g.backends[index].config.ID, err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// followTunerEvents reads Mirakurun's JSON array one event at a time and rewrites
+// tuner data exactly like /api/tuners before handing it on.
+func (g *Gateway) followTunerEvents(ctx context.Context, index int, out chan<- object) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL(g.backends[index].base, "/events/stream", "resource=tuner"), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "Sakurako")
+	resp, err := g.eventsClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	if _, err := dec.Token(); err != nil { // opening '['
+		return err
+	}
+	for {
+		var e object
+		if err := dec.Decode(&e); err != nil {
+			return err
+		}
+		if data, ok := e["data"].(map[string]any); ok {
+			g.exposeTuner(data, index)
+		}
+		select {
+		case out <- e:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }

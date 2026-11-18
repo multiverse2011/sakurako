@@ -69,6 +69,9 @@ type fakeBackend struct {
 	failPrograms       int
 	failTuners         int
 	stallTuners        bool
+	events             chan object
+	failEvents         int
+	eventCanceled      chan struct{}
 }
 
 func fixture(n, s int64, name string) (object, object) {
@@ -78,7 +81,7 @@ func fixture(n, s int64, name string) (object, object) {
 func newFake(t *testing.T, n int64, name string) *fakeBackend {
 	t.Helper()
 	s, p := fixture(n, 101, name)
-	f := &fakeBackend{services: []object{s}, programs: []object{p}, started: make(chan http.Header, 10), canceled: make(chan struct{}, 10)}
+	f := &fakeBackend{services: []object{s}, programs: []object{p}, started: make(chan http.Header, 10), canceled: make(chan struct{}, 10), eventCanceled: make(chan struct{}, 10)}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		down, status, stall, end := f.down, f.streamStatus, f.stall, f.end
@@ -86,6 +89,7 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 		continuous := f.continuous
 		failServices, failPrograms, failTuners := f.failServices, f.failPrograms, f.failTuners
 		stallTuners := f.stallTuners
+		failEvents := f.failEvents
 		oversizeServices, oversizePrograms := f.oversizeServices, f.oversizePrograms
 		location, statusFor := f.streamLocation, f.streamStatusFor
 		s, p := f.services, f.programs
@@ -129,6 +133,26 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 				return
 			}
 			respond(w, 200, p)
+		case "/api/events/stream":
+			if failEvents != 0 {
+				http.Error(w, "events unavailable", failEvents)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, "[\n")
+			w.(http.Flusher).Flush()
+			defer func() { f.eventCanceled <- struct{}{} }()
+			for {
+				select {
+				case e := <-f.events:
+					b, _ := json.Marshal(e)
+					_, _ = w.Write(append(b, '\n', ','))
+					w.(http.Flusher).Flush()
+				case <-r.Context().Done():
+					return
+				}
+			}
 		default:
 			if strings.HasSuffix(r.URL.Path, "/logo") {
 				if f.logo == nil {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -665,8 +666,11 @@ func TestEventsStreamKeepsConnectionOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "text/event-stream" {
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "application/json; charset=utf-8" {
 		t.Fatalf("events: %d %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	if head, err := io.ReadAll(io.LimitReader(resp.Body, 2)); err != nil || string(head) != "[\n" {
+		t.Fatalf("events body start: %q %v", head, err)
 	}
 
 	getJSON(t, s.URL+"/api/events/stream?resource=service", 400, nil)
@@ -678,6 +682,93 @@ func TestEventsStreamKeepsConnectionOpen(t *testing.T) {
 	headResp.Body.Close()
 	if headResp.StatusCode != 200 {
 		t.Fatalf("HEAD events: %d", headResp.StatusCode)
+	}
+}
+
+// openEvents subscribes to the gateway's tuner events and skips the opening bracket.
+func openEvents(t *testing.T, base string) (*http.Response, *json.Decoder) {
+	t.Helper()
+	resp, err := testClient.Get(base + "/api/events/stream?resource=tuner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	if _, err := dec.Token(); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	return resp, dec
+}
+
+func TestEventsRelaysRewrittenTunerEvents(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 10, "B")
+	b.events = make(chan object, 1)
+	_, s := gateway(t, a, b)
+
+	resp, dec := openEvents(t, s.URL)
+	defer resp.Body.Close()
+	b.events <- object{"resource": "tuner", "type": "update", "time": 1, "data": object{
+		"index": 0,
+		"name":  "tuner0",
+		"users": []any{object{"id": "user", "streamSetting": object{"channel": object{"type": "GR", "channel": "27"}}}},
+	}}
+
+	var e object
+	if err := dec.Decode(&e); err != nil {
+		t.Fatal(err)
+	}
+	if e["resource"] != "tuner" || e["type"] != "update" {
+		t.Fatalf("relayed event: %v", e)
+	}
+	data, _ := e["data"].(map[string]any)
+	if number(data, "index") != 10000 || data["name"] != "region1/tuner0" {
+		t.Fatalf("tuner identity not rewritten: %v", data)
+	}
+	users, _ := data["users"].([]any)
+	user, _ := users[0].(map[string]any)
+	channel, _ := user["streamSetting"].(map[string]any)["channel"].(map[string]any)
+	if channel["channel"] != "region1-3237" {
+		t.Fatalf("event channel not rewritten: %v", channel)
+	}
+}
+
+func TestEventsSurvivesBackendSubscriptionFailure(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 10, "B")
+	a.failEvents = 503
+	b.events = make(chan object, 1)
+	_, s := gateway(t, a, b)
+
+	resp, dec := openEvents(t, s.URL)
+	defer resp.Body.Close()
+	b.events <- object{"resource": "tuner", "type": "create", "time": 2, "data": object{"index": 0, "name": "tuner0"}}
+	var e object
+	if err := dec.Decode(&e); err != nil {
+		t.Fatalf("event from the healthy backend: %v", err)
+	}
+	// The stream stays usable after the failed subscription's reconnect attempts.
+	b.events <- object{"resource": "tuner", "type": "update", "time": 3, "data": object{"index": 1, "name": "tuner1"}}
+	if err := dec.Decode(&e); err != nil {
+		t.Fatalf("second event: %v", err)
+	}
+}
+
+func TestEventsClientDisconnectClosesUpstream(t *testing.T) {
+	a := newFake(t, 10, "A")
+	a.events = make(chan object, 1)
+	_, s := gateway(t, a)
+
+	resp, dec := openEvents(t, s.URL)
+	a.events <- object{"resource": "tuner", "type": "update", "time": 1, "data": object{"index": 0, "name": "tuner0"}}
+	var e object
+	if err := dec.Decode(&e); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	select {
+	case <-a.eventCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client disconnect did not close the backend subscription")
 	}
 }
 
