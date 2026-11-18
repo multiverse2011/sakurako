@@ -79,11 +79,11 @@ type Gateway struct {
 	// NewGateway (tests only mutate them between requests); services, programs,
 	// updated, healthy, cooldowns and err are read and written under mu.
 	// len(backends) is fixed. Catalog objects handed out by snapshot are read-only.
-	mu                          sync.RWMutex
-	syncMu                      sync.Mutex
-	loggedChannelConflicts      string // guarded by syncMu
-	backends                    []backend
-	catalogClient, streamClient *http.Client
+	mu                                        sync.RWMutex
+	syncMu                                    sync.Mutex
+	loggedChannelConflicts                    string // guarded by syncMu
+	backends                                  []backend
+	catalogClient, streamClient, eventsClient *http.Client
 }
 
 func number(o object, key string) int64 {

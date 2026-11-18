@@ -252,9 +252,9 @@ func endpoints() []endpoint {
 			tags: monitoring,
 			get: operation{
 				summary:     "Tuner event stream",
-				description: "Server-sent events connection kept open for Mirakurun clients. Tuner changes are not pushed; clients poll /api/tuners. Cache-Control: no-store.",
+				description: "Tuner events relayed from every backend in Mirakurun's format: an unclosed JSON array of {resource, type, data, time} objects. Tuner data is rewritten like /api/tuners. Tuner changes arrive as they happen; only while a backend subscription is down is a newline keepalive written every 15 seconds. Cache-Control: no-store.",
 				parameters:  []any{object{"name": "resource", "in": "query", "required": true, "schema": object{"type": "string", "enum": []any{"tuner"}}, "description": "Only resource=tuner is supported."}},
-				responses:   getResponses(object{"description": "Event stream; keepalive comments keep it open.", "content": object{"text/event-stream": object{"schema": object{"type": "string"}}}}, "400"),
+				responses:   getResponses(object{"description": "Event stream; the JSON array stays open and never closes.", "content": object{"application/json": object{"schema": object{"type": "string"}}}}, "400"),
 			},
 			head: operation{
 				summary:     "Check event stream availability (headers only)",

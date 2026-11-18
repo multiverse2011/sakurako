@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -665,8 +668,11 @@ func TestEventsStreamKeepsConnectionOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "text/event-stream" {
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "application/json; charset=utf-8" {
 		t.Fatalf("events: %d %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	if head, err := io.ReadAll(io.LimitReader(resp.Body, 2)); err != nil || string(head) != "[\n" {
+		t.Fatalf("events body start: %q %v", head, err)
 	}
 
 	getJSON(t, s.URL+"/api/events/stream?resource=service", 400, nil)
@@ -678,6 +684,241 @@ func TestEventsStreamKeepsConnectionOpen(t *testing.T) {
 	headResp.Body.Close()
 	if headResp.StatusCode != 200 {
 		t.Fatalf("HEAD events: %d", headResp.StatusCode)
+	}
+}
+
+// openEvents subscribes to the gateway's tuner events and skips the opening bracket.
+func openEvents(t *testing.T, base string) (*http.Response, *json.Decoder) {
+	t.Helper()
+	resp, err := testClient.Get(base + "/api/events/stream?resource=tuner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+		resp.Body.Close()
+		t.Fatalf("event stream start: %v %v", tok, err)
+	}
+	return resp, dec
+}
+
+func TestEventsRelaysRewrittenTunerEvents(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 10, "B")
+	b.events = make(chan object, 1)
+	_, s := gateway(t, a, b)
+
+	resp, dec := openEvents(t, s.URL)
+	defer resp.Body.Close()
+	b.events <- object{"resource": "tuner", "type": "update", "time": 1, "data": object{
+		"index": 0,
+		"name":  "tuner0",
+		"users": []any{object{"id": "user", "streamSetting": object{"channel": object{"type": "GR", "channel": "27"}}}},
+	}}
+
+	var e object
+	if err := dec.Decode(&e); err != nil {
+		t.Fatal(err)
+	}
+	if e["resource"] != "tuner" || e["type"] != "update" {
+		t.Fatalf("relayed event: %v", e)
+	}
+	data, _ := e["data"].(map[string]any)
+	if number(data, "index") != 10000 || data["name"] != "region1/tuner0" {
+		t.Fatalf("tuner identity not rewritten: %v", data)
+	}
+	users, _ := data["users"].([]any)
+	user, _ := users[0].(map[string]any)
+	channel, _ := user["streamSetting"].(map[string]any)["channel"].(map[string]any)
+	if channel["channel"] != "region1-3237" {
+		t.Fatalf("event channel not rewritten: %v", channel)
+	}
+}
+
+func TestEventsSurvivesBackendSubscriptionFailure(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 10, "B")
+	a.failEvents = 503
+	b.events = make(chan object, 1)
+	_, s := gateway(t, a, b)
+
+	resp, dec := openEvents(t, s.URL)
+	defer resp.Body.Close()
+	b.events <- object{"resource": "tuner", "type": "create", "time": 2, "data": object{"index": 0, "name": "tuner0"}}
+	var e object
+	if err := dec.Decode(&e); err != nil {
+		t.Fatalf("event from the healthy backend: %v", err)
+	}
+	// A failing subscription must not stall the stream.
+	b.events <- object{"resource": "tuner", "type": "update", "time": 3, "data": object{"index": 1, "name": "tuner1"}}
+	if err := dec.Decode(&e); err != nil {
+		t.Fatalf("second event: %v", err)
+	}
+	if data, _ := e["data"].(map[string]any); number(data, "index") != 10001 {
+		t.Fatalf("second event index not rewritten: %v", data)
+	}
+}
+
+func TestEventsResubscribesAfterFailedSubscription(t *testing.T) {
+	shortenEventTimings(t)
+	a := newFake(t, 10, "A")
+	a.events = make(chan object, 1)
+	a.failEvents = 503
+	_, s := gateway(t, a)
+
+	resp, dec := openEvents(t, s.URL)
+	defer resp.Body.Close()
+	select {
+	case <-a.eventTried:
+	case <-time.After(3 * time.Second):
+		t.Fatal("event subscription was not attempted")
+	}
+	a.mu.Lock()
+	a.failEvents = 0
+	a.mu.Unlock()
+	a.events <- object{"resource": "tuner", "type": "update", "time": 1, "data": object{"index": 0, "name": "tuner0"}}
+	var e object
+	if err := dec.Decode(&e); err != nil {
+		t.Fatalf("event after resubscribe: %v", err)
+	}
+	if data, _ := e["data"].(map[string]any); number(data, "index") != 0 {
+		t.Fatalf("resubscribed event: %v", data)
+	}
+}
+
+func TestEventsKeepaliveOnlyWhileDisconnected(t *testing.T) {
+	shortenEventTimings(t)
+	a := newFake(t, 10, "A")
+	a.events = make(chan object, 1)
+	a.failEvents = 503
+	_, s := gateway(t, a)
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(s.URL + "/api/events/stream?resource=tuner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+	if start, err := br.ReadString('\n'); err != nil || start != "[\n" {
+		t.Fatalf("event stream start: %q %v", start, err)
+	}
+	// The only subscription is down, so a keepalive newline must arrive.
+	if b, err := br.ReadByte(); err != nil || b != '\n' {
+		t.Fatalf("keepalive while disconnected: %q %v", b, err)
+	}
+	a.mu.Lock()
+	a.failEvents = 0
+	a.mu.Unlock()
+	a.events <- object{"resource": "tuner", "type": "update", "time": 1, "data": object{"index": 0, "name": "tuner0"}}
+	// Newlines before the event are whitespace in the array, so the event decodes.
+	dec := json.NewDecoder(br)
+	dec.UseNumber()
+	var e object
+	if err := dec.Decode(&e); err != nil {
+		t.Fatalf("event after keepalive: %v", err)
+	}
+	if data, _ := e["data"].(map[string]any); number(data, "index") != 0 {
+		t.Fatalf("event after keepalive: %v", data)
+	}
+	// Every subscription is live now, so nothing more may be written.
+	got := make(chan byte, 1)
+	go func() {
+		if b, err := br.ReadByte(); err == nil {
+			got <- b
+		}
+	}()
+	select {
+	case b := <-got:
+		t.Fatalf("unexpected byte %q while all subscriptions are live", b)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestEventsResumesAfterUpstreamDrop(t *testing.T) {
+	shortenEventTimings(t)
+	// Keep the subscription down longer than the keepalive interval.
+	tunerEventRetry = 100 * time.Millisecond
+	a := newFake(t, 10, "A")
+	a.events = make(chan object, 1)
+	a.closeEventsOnce.Store(true)
+	_, s := gateway(t, a)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(s.URL + "/api/events/stream?resource=tuner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+	readLine := func() string {
+		t.Helper()
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read events stream: %v", err)
+		}
+		return line
+	}
+	if line := readLine(); line != "[\n" {
+		t.Fatalf("event stream start: %q", line)
+	}
+	next := func() object {
+		t.Helper()
+		for {
+			line := readLine()
+			if line == "\n" || line == ",\n" {
+				continue // keepalive or element separator
+			}
+			dec := json.NewDecoder(strings.NewReader(line))
+			dec.UseNumber()
+			var e object
+			if err := dec.Decode(&e); err != nil {
+				t.Fatalf("event line %q: %v", line, err)
+			}
+			return e
+		}
+	}
+	a.events <- object{"resource": "tuner", "type": "update", "time": 1, "data": object{"index": 0, "name": "tuner0"}}
+	if e := next(); e["type"] != "update" {
+		t.Fatalf("first event: %v", e)
+	}
+	// The fake closes the upstream after that event, so the keepalive must resume
+	// until the subscription is back.
+	if line := readLine(); line != ",\n" {
+		t.Fatalf("event separator: %q", line)
+	}
+	if line := readLine(); line != "\n" {
+		t.Fatalf("keepalive after upstream drop: %q", line)
+	}
+	a.events <- object{"resource": "tuner", "type": "create", "time": 2, "data": object{"index": 0, "name": "tuner1"}}
+	if e := next(); e["type"] != "create" {
+		t.Fatalf("event after resubscribe: %v", e)
+	}
+}
+
+// shortenEventTimings makes reconnect and keepalive gaps testable in milliseconds.
+func shortenEventTimings(t *testing.T) {
+	t.Helper()
+	keepalive, retry := tunerEventKeepalive, tunerEventRetry
+	tunerEventKeepalive, tunerEventRetry = 20*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { tunerEventKeepalive, tunerEventRetry = keepalive, retry })
+}
+
+func TestEventsClientDisconnectClosesUpstream(t *testing.T) {
+	a := newFake(t, 10, "A")
+	a.events = make(chan object, 1)
+	_, s := gateway(t, a)
+
+	resp, dec := openEvents(t, s.URL)
+	a.events <- object{"resource": "tuner", "type": "update", "time": 1, "data": object{"index": 0, "name": "tuner0"}}
+	var e object
+	if err := dec.Decode(&e); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	select {
+	case <-a.eventCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client disconnect did not close the backend subscription")
 	}
 }
 
