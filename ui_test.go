@@ -224,6 +224,23 @@ func TestUIServicesFilterMarkup(t *testing.T) {
 	}
 }
 
+// The UI has no JS test runner; this pins the refresh wiring and the paused label behind the screenshots.
+func TestUIManualRefreshControls(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	for _, tc := range []struct{ path, want string }{
+		{"/ui/", `id="updated"`},
+		{"/ui/", `id="refresh"`},
+		{"/ui/app.js", `$('refresh').addEventListener`},
+		{"/ui/app.js", `Auto reload paused`},
+	} {
+		recorder := httptest.NewRecorder()
+		g.ServeHTTP(recorder, httptest.NewRequest("GET", tc.path, nil))
+		if !strings.Contains(recorder.Body.String(), tc.want) {
+			t.Errorf("%s does not contain %s", tc.path, tc.want)
+		}
+	}
+}
+
 func TestUISharedServiceListsEveryCandidate(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"), newFake(t, 10, "service"))
 	snapshot := g.uiState(time.Now())
