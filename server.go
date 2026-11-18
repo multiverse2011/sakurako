@@ -65,6 +65,7 @@ func NewGateway(c Config) (*Gateway, error) {
 		}
 		g.backends = append(g.backends, backend{config: b, base: base, blockedServices: map[int64]time.Time{}})
 	}
+	g.cat = g.buildCatalog() // empty until the first sync
 	return g, nil
 }
 func respond(w http.ResponseWriter, status int, v any) {
@@ -128,16 +129,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.events(w, r)
 		return
 	}
-	// Reject unknown endpoints before paying for a full snapshot.
+	// Reject unknown endpoints before reading the catalog.
 	switch parts[1] {
 	case "services", "programs", "channels":
 	default:
 		apiError(w, 404, "endpoint not supported")
 		return
 	}
-	g.mu.RLock()
-	cat := g.snapshot(time.Now())
-	g.mu.RUnlock()
+	cat := g.catalogNow(time.Now())
 	if len(parts) == 4 && parts[1] == "services" && parts[3] == "logo" {
 		id, err := strconv.ParseInt(parts[2], 10, 64)
 		if err != nil {
@@ -275,9 +274,9 @@ func nilIfExpired(now, t time.Time) any {
 }
 
 func (g *Gateway) health(w http.ResponseWriter) {
-	g.mu.RLock()
 	now := time.Now()
-	cat := g.snapshot(now)
+	cat := g.catalogNow(now)
+	g.mu.RLock()
 	maxStale := time.Duration(g.config.MaxStaleSeconds) * time.Second
 	states := []object{}
 	available := 0

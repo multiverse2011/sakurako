@@ -236,9 +236,7 @@ func TestHealthTimestampsAndConflictStatus(t *testing.T) {
 	// The conflict half the name promises: differing domains make /healthz 503.
 	a, b := newFake(t, 10, "different"), newFake(t, 10, "broadcast")
 	g, s := gateway(t, a, b)
-	g.mu.Lock()
-	g.backends[1].config.ServiceDomain = "different-domain"
-	g.mu.Unlock()
+	changeBackend(g, 1, func(b *backend) { b.config.ServiceDomain = "different-domain" })
 	var conflict struct {
 		Ready     bool    `json:"ready"`
 		Conflicts []int64 `json:"conflicting_service_ids"`
