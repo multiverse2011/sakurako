@@ -432,7 +432,8 @@ func TestChannelConflictSurvivesExpiredWinner(t *testing.T) {
 		t.Fatalf("conflict not reported: %+v", h)
 	}
 
-	// The winner expires without a sync; the conflict must not be forgotten.
+	// Rewind the winner past max_stale as if no sync had happened; the catalog is
+	// republished the way Sync does, and the conflict must not be forgotten.
 	changeBackend(g, 0, func(b *backend) { b.updated = time.Now().Add(-2 * time.Minute) })
 	getJSON(t, s.URL+"/healthz", 503, &h)
 	if len(h.ChannelConflicts) != 1 || h.ChannelConflicts[0] != "GR/27" {
@@ -598,7 +599,7 @@ func TestChannelConflictSourcesAreNotDuplicated(t *testing.T) {
 	// Map iteration order varies per call; a stale alias would duplicate a source.
 	for i := 0; i < 20; i++ {
 		g.mu.RLock()
-		cat := g.buildCatalog()
+		cat := g.buildCatalog(time.Now())
 		g.mu.RUnlock()
 		if len(cat.channelConflicts) != 1 {
 			t.Fatalf("pass %d: conflicts %v", i, cat.channelConflicts)

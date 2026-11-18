@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http/httptest"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
 )
 
-// Requests must read the catalog Sync published, not rebuild it from backend state.
+// Requests read the catalog Sync published, so changing backend state without a
+// sync must not change what any catalog endpoint returns.
 func TestRequestsDoNotRebuildCatalog(t *testing.T) {
 	a := newFake(t, 10, "A")
 	g, s := gateway(t, a)
@@ -17,10 +18,16 @@ func TestRequestsDoNotRebuildCatalog(t *testing.T) {
 	g.mu.Lock()
 	g.backends[0].services = []object{}
 	g.mu.Unlock()
-	var services []object
+
+	var services, channels []object
+	var state struct{ Services []object }
+	var one object
 	getJSON(t, s.URL+"/api/services", 200, &services)
-	if len(services) != 1 {
-		t.Fatalf("request rebuilt the catalog: %v", services)
+	getJSON(t, s.URL+"/api/channels", 200, &channels)
+	getJSON(t, s.URL+"/-/ui/state", 200, &state)
+	getJSON(t, s.URL+"/api/services/1000101", 200, &one)
+	if len(services) != 1 || len(channels) != 1 || len(state.Services) != 1 || one["name"] != "A" {
+		t.Fatalf("a request rebuilt the catalog: %v / %v / %v / %v", services, channels, state.Services, one)
 	}
 }
 
@@ -29,9 +36,9 @@ func TestCatalogChangeVisibleAfterSync(t *testing.T) {
 	a := newFake(t, 10, "A")
 	g, s := gateway(t, a)
 	setName := func(name string) {
-		s, p := fixture(10, 101, name)
+		svc, prg := fixture(10, 101, name)
 		a.mu.Lock()
-		a.services, a.programs = []object{s}, []object{p}
+		a.services, a.programs = []object{svc}, []object{prg}
 		a.mu.Unlock()
 		g.Sync(context.Background())
 	}
@@ -49,12 +56,19 @@ func TestCatalogChangeVisibleAfterSync(t *testing.T) {
 	}
 }
 
-// Requests during a sync keep getting one complete catalog, never a mixture.
-func TestCatalogConsistentDuringSync(t *testing.T) {
+// Concurrent requests keep getting complete, successful responses while syncs
+// replace the catalog. This does not assert that a response never straddles two
+// syncs: a rebuild while the cached catalog is expired can include backends the
+// in-flight sync already committed, which is the pre-cache behaviour too.
+func TestCatalogServesDuringConcurrentSync(t *testing.T) {
 	a := newFake(t, 10, "A")
 	g, s := gateway(t, a)
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
@@ -91,17 +105,14 @@ func TestCatalogConsistentDuringSync(t *testing.T) {
 		var services []object
 		getJSON(t, s.URL+"/api/services", 200, &services)
 		if len(services) != 1 || services[0]["name"] != name {
-			close(stop)
-			wg.Wait()
 			t.Fatalf("sync %d not visible: %v", i, services)
 		}
 	}
-	close(stop)
-	wg.Wait()
 }
 
-// The catalog is the only place freshness is time-dependent: a backend that
-// crosses max_stale_seconds between syncs stops being served.
+// The freshness cutoff is the only time-dependent part of the catalog: a backend
+// that crosses max_stale_seconds between syncs stops being served. The clock is
+// injected so the test never sleeps.
 func TestCatalogExpiresBetweenSyncs(t *testing.T) {
 	a := newFake(t, 10, "A")
 	c := Config{Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 2, StreamTimeoutSeconds: 1,
@@ -111,21 +122,49 @@ func TestCatalogExpiresBetweenSyncs(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.Sync(context.Background())
-	s := httptest.NewServer(g)
-	t.Cleanup(s.Close)
 
-	g.mu.Lock()
-	g.backends[0].updated = time.Now().Add(-time.Second) // expires in ~1s without a sync
-	g.cat = g.buildCatalog()
-	g.mu.Unlock()
-	var services []object
-	getJSON(t, s.URL+"/api/services", 200, &services)
-	if len(services) != 1 {
-		t.Fatalf("fresh catalog dropped early: %v", services)
+	base := time.Now()
+	changeBackend(g, 0, func(b *backend) { b.updated = base })
+	if got := g.catalogNow(base.Add(time.Second)); len(got.services) != 1 {
+		t.Fatalf("fresh catalog dropped early: %v", got.services)
 	}
-	time.Sleep(1200 * time.Millisecond)
-	getJSON(t, s.URL+"/api/services", 200, &services)
-	if len(services) != 0 {
-		t.Fatalf("expired catalog still served: %v", services)
+	if got := g.catalogNow(base.Add(3 * time.Second)); len(got.services) != 0 {
+		t.Fatalf("expired catalog still served: %v", got.services)
+	}
+}
+
+// The same expiry, with a conflicting channel name: without a sync, an expired
+// winner must keep the conflict and must not fail over to another broadcast.
+// catalogNow publishes the catalog rebuilt at the injected instant, so the
+// requests below see exactly what a real expiry would have published.
+func TestExpiredWinnerKeepsConflictWithoutSync(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 20, "B")
+	g, s := sharedDomainGateway(t, "upstream", a, b)
+
+	cat := g.catalogNow(time.Now().Add(2 * time.Hour))
+	if len(cat.channelConflicts) != 1 || cat.channelConflicts[0].key != "GR/27" {
+		t.Fatalf("conflict dropped after expiry: %v", cat.channelConflicts)
+	}
+	if sources := cat.channelSources["GR/27"]; len(sources) != 0 {
+		t.Fatalf("expired sources still served: %v", sources)
+	}
+	var h healthResponse
+	getJSON(t, s.URL+"/healthz", 503, &h)
+	if len(h.ChannelConflicts) != 1 || h.ChannelConflicts[0] != "GR/27" {
+		t.Fatalf("health lost the conflict: %+v", h)
+	}
+	var channels []object
+	getJSON(t, s.URL+"/api/channels", 200, &channels)
+	if len(channels) != 0 {
+		t.Fatalf("expired winner still listed: %v", channels)
+	}
+	req, _ := http.NewRequest("HEAD", s.URL+"/api/channels/GR/27/stream", nil)
+	resp, err := testClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 404 || b.streamCalls.Load() != 0 {
+		t.Fatalf("failed over to another broadcast after expiry: %d", resp.StatusCode)
 	}
 }

@@ -65,7 +65,7 @@ func NewGateway(c Config) (*Gateway, error) {
 		}
 		g.backends = append(g.backends, backend{config: b, base: base, blockedServices: map[int64]time.Time{}})
 	}
-	g.cat = g.buildCatalog() // empty until the first sync
+	g.cat = g.buildCatalog(time.Now()) // empty until the first sync
 	return g, nil
 }
 func respond(w http.ResponseWriter, status int, v any) {

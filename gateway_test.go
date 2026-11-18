@@ -270,7 +270,7 @@ func changeBackend(g *Gateway, i int, fn func(*backend)) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	fn(&g.backends[i])
-	g.cat = g.buildCatalog()
+	g.cat = g.buildCatalog(time.Now())
 }
 func getJSON(t *testing.T, url string, status int, v any) {
 	t.Helper()

@@ -51,7 +51,8 @@ type catalog struct {
 	conflicts                    []int64
 	channelConflicts             []channelConflict
 	// expires is when a backend first stops being fresh without a sync. Zero
-	// means only a sync can change the catalog. Guarded by mu; never encoded.
+	// means only a sync can change the catalog. Guarded by mu like the rest of
+	// the cached catalog; not part of any response.
 	expires time.Time
 }
 
@@ -286,9 +287,12 @@ func (g *Gateway) Sync(ctx context.Context) {
 	}
 	wg.Wait()
 	// Publish the catalog once, after every backend has committed, so requests
-	// during a sync keep seeing the previous catalog rather than a mixture.
+	// during a sync keep seeing the previous catalog. This holds while that
+	// catalog is fresh; if it has already expired, catalogNow rebuilds from
+	// whatever the in-flight sync has committed so far, as the old per-request
+	// assembly did.
 	g.mu.Lock()
-	cat := g.buildCatalog()
+	cat := g.buildCatalog(time.Now())
 	g.cat = cat
 	g.mu.Unlock()
 	g.logChannelConflicts(cat)
@@ -342,14 +346,14 @@ func (g *Gateway) catalogNow(now time.Time) catalog {
 	if g.cat.expires.IsZero() || now.Before(g.cat.expires) {
 		return g.cat // another request rebuilt it while this one waited
 	}
-	g.cat = g.buildCatalog()
+	g.cat = g.buildCatalog(now)
 	return g.cat
 }
 
-// buildCatalog assembles the catalog from committed backend state, so responses
-// depend only on local data and never on live backend requests. Called under mu.
-func (g *Gateway) buildCatalog() catalog {
-	now := time.Now()
+// buildCatalog assembles the catalog from committed backend state as of now, so
+// responses depend only on local data and never on live backend requests. Called
+// with mu held, or by NewGateway before the gateway is shared.
+func (g *Gateway) buildCatalog(now time.Time) catalog {
 	c := catalog{services: []object{}, programs: []object{}, channels: []object{}, sources: map[int64][]source{}, channelSources: map[string][]source{}, conflicts: []int64{}, channelConflicts: []channelConflict{}}
 	maxStale := time.Duration(g.config.MaxStaleSeconds) * time.Second
 	fresh := make([]bool, len(g.backends))
