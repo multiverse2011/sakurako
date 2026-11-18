@@ -71,6 +71,7 @@ type fakeBackend struct {
 	stallTuners        bool
 	events             chan object
 	failEvents         int
+	closeEventsOnce    atomic.Bool // close the next healthy subscription after one event
 	eventTried         chan struct{}
 	eventCanceled      chan struct{}
 }
@@ -148,12 +149,16 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 			_, _ = io.WriteString(w, "[\n")
 			w.(http.Flusher).Flush()
 			defer func() { f.eventCanceled <- struct{}{} }()
+			closeAfterEvent := f.closeEventsOnce.CompareAndSwap(true, false)
 			for {
 				select {
 				case e := <-events:
 					b, _ := json.Marshal(e)
 					_, _ = w.Write(append(b, '\n', ','))
 					w.(http.Flusher).Flush()
+					if closeAfterEvent {
+						return
+					}
 				case <-r.Context().Done():
 					return
 				}

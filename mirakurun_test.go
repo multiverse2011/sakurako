@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -830,6 +831,67 @@ func TestEventsKeepaliveOnlyWhileDisconnected(t *testing.T) {
 	case b := <-got:
 		t.Fatalf("unexpected byte %q while all subscriptions are live", b)
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestEventsResumesAfterUpstreamDrop(t *testing.T) {
+	shortenEventTimings(t)
+	// Keep the subscription down longer than the keepalive interval.
+	tunerEventRetry = 100 * time.Millisecond
+	a := newFake(t, 10, "A")
+	a.events = make(chan object, 1)
+	a.closeEventsOnce.Store(true)
+	_, s := gateway(t, a)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(s.URL + "/api/events/stream?resource=tuner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+	readLine := func() string {
+		t.Helper()
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read events stream: %v", err)
+		}
+		return line
+	}
+	if line := readLine(); line != "[\n" {
+		t.Fatalf("event stream start: %q", line)
+	}
+	next := func() object {
+		t.Helper()
+		for {
+			line := readLine()
+			if line == "\n" || line == ",\n" {
+				continue // keepalive or element separator
+			}
+			dec := json.NewDecoder(strings.NewReader(line))
+			dec.UseNumber()
+			var e object
+			if err := dec.Decode(&e); err != nil {
+				t.Fatalf("event line %q: %v", line, err)
+			}
+			return e
+		}
+	}
+	a.events <- object{"resource": "tuner", "type": "update", "time": 1, "data": object{"index": 0, "name": "tuner0"}}
+	if e := next(); e["type"] != "update" {
+		t.Fatalf("first event: %v", e)
+	}
+	// The fake closes the upstream after that event, so the keepalive must resume
+	// until the subscription is back.
+	if line := readLine(); line != ",\n" {
+		t.Fatalf("event separator: %q", line)
+	}
+	if line := readLine(); line != "\n" {
+		t.Fatalf("keepalive after upstream drop: %q", line)
+	}
+	a.events <- object{"resource": "tuner", "type": "create", "time": 2, "data": object{"index": 0, "name": "tuner1"}}
+	if e := next(); e["type"] != "create" {
+		t.Fatalf("event after resubscribe: %v", e)
 	}
 }
 
