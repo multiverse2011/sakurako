@@ -408,7 +408,7 @@
       "tags":
         - "Monitoring"
     "head":
-      "description": "Returns the same headers as GET without querying the backends."
+      "description": "Returns the same headers as GET; no body and no backend query."
       "responses":
         "200":
           "description": "Headers only; no body"

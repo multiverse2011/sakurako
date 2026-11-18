@@ -75,7 +75,8 @@ func (g *Gateway) serveUI(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if r.URL.Path == "/-/ui/tuners" {
 		w.Header().Set("Cache-Control", "no-store")
-		// HEAD only reports the headers; the counts are a live query per backend.
+		w.Header().Set("Content-Type", "application/json")
+		// HEAD reports these headers without the live per-backend counts.
 		if r.Method != "HEAD" {
 			if counts := g.tunerCounts(r.Context()); counts != nil {
 				respond(w, 200, counts)

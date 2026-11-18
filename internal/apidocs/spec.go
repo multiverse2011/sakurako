@@ -287,7 +287,7 @@ func endpoints() []endpoint {
 			},
 			head: operation{
 				summary:     "Read UI tuner counts (headers only)",
-				description: "Returns the same headers as GET without querying the backends.",
+				description: "Returns the same headers as GET; no body and no backend query.",
 				responses:   headResponses("400"),
 			},
 		},
