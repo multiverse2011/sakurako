@@ -161,6 +161,20 @@ func TestEmbeddedAPIDocs(t *testing.T) {
 	}
 }
 
+// Backends 表の見出しが、転送量ではなく件数であることを示しているか（トラフィック欄は帯域）。
+func TestBackendsColumnIsNotTraffic(t *testing.T) {
+	html, err := uiFiles.ReadFile("ui/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(html), "Upstream / Downstream") {
+		t.Fatal("ambiguous Upstream / Downstream header")
+	}
+	if !strings.Contains(string(html), "Streams / Clients") {
+		t.Fatal("missing Streams / Clients header")
+	}
+}
+
 func TestOpenAPIConditionalRequests(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"))
 	for _, path := range []string{"/openapi.yml", "/openapi.json"} {
