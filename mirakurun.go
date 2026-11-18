@@ -187,7 +187,10 @@ func (g *Gateway) followTunerEvents(ctx context.Context, index int, out chan<- o
 		return err
 	}
 	defer resp.Body.Close()
+	// Drain a bounded error body so repeated failures can reuse the connection.
+	drain := func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10)) }
 	if resp.StatusCode != 200 {
+		drain()
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	dec := json.NewDecoder(resp.Body)
@@ -195,6 +198,7 @@ func (g *Gateway) followTunerEvents(ctx context.Context, index int, out chan<- o
 	if tok, err := dec.Token(); err != nil {
 		return err
 	} else if tok != json.Delim('[') {
+		drain()
 		return fmt.Errorf("not an event stream: starts with %v", tok)
 	}
 	live.Add(1)
