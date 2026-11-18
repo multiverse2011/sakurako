@@ -192,6 +192,22 @@ func TestCountTunersIsUsing(t *testing.T) {
 	}
 }
 
+func TestLogsPanelOffersPauseAndFilters(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	for path, needles := range map[string][]string{
+		"/ui/":       {`id="log-pause"`, `id="log-query"`, `id="log-backend"`},
+		"/ui/app.js": {`'log-pause'`, `'log-query'`, `'log-backend'`, `logPaused`},
+	} {
+		r := httptest.NewRecorder()
+		g.ServeHTTP(r, httptest.NewRequest("GET", path, nil))
+		for _, needle := range needles {
+			if !strings.Contains(r.Body.String(), needle) {
+				t.Errorf("%s: missing %s", path, needle)
+			}
+		}
+	}
+}
+
 func TestUIServiceTypeSurvivesVirtualChannel(t *testing.T) {
 	g, server := gateway(t, newFake(t, 10, "regional service"))
 	snapshot := g.uiState(time.Now())
