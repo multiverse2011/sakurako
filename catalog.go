@@ -51,8 +51,9 @@ type catalog struct {
 	conflicts                    []int64
 	channelConflicts             []channelConflict
 	// expires is when a backend first stops being fresh without a sync. Zero
-	// means only a sync can change the catalog. Guarded by mu like the rest of
-	// the cached catalog; not part of any response.
+	// means only a sync can change the catalog. buildCatalog sets it under mu
+	// like the rest of the catalog; copies it returns are read-only and not
+	// part of any response.
 	expires time.Time
 }
 

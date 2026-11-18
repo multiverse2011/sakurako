@@ -18,6 +18,9 @@ import (
 // work, which scales with the item counts this fixture gets right.
 func benchCatalog(b *testing.B) (*Gateway, *httptest.Server) {
 	b.Helper()
+	// Build the fixture outside the measured region: -benchtime=1x reports the one
+	// measured run of the benchmark function, which otherwise includes all this.
+	b.StopTimer()
 	var services, programs [2][]map[string]any
 	for i := int64(0); i < 147; i++ {
 		bi, networkID := 0, int64(1)
@@ -81,26 +84,41 @@ func benchCatalog(b *testing.B) (*Gateway, *httptest.Server) {
 	g.Sync(context.Background())
 	s := httptest.NewServer(g)
 	b.Cleanup(s.Close)
-	b.ResetTimer()
+	b.StartTimer()
 	return g, s
 }
 
 func benchGet(b *testing.B, url string) {
 	b.Helper()
 	b.ReportAllocs()
+	b.StopTimer()
+	// Warm the process's one-time HTTP path, so the first counted iteration under
+	// -benchtime=1x is not the one carrying it.
+	get(url)
+	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		resp, err := http.Get(url)
-		if err != nil {
+		if err := get(url); err != nil {
 			b.Fatal(err)
 		}
-		if resp.StatusCode != 200 {
-			b.Fatalf("HTTP %d", resp.StatusCode)
-		}
-		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-			b.Fatal(err)
-		}
-		resp.Body.Close()
 	}
+}
+
+// get reads a whole response body; io.Discard buffers count toward B/op even on
+// the first iteration, so every iteration reads identically.
+func get(url string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		return fmt.Errorf("%s: HTTP %d", url, resp.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		resp.Body.Close()
+		return err
+	}
+	return resp.Body.Close()
 }
 
 func BenchmarkUIState(b *testing.B) {
