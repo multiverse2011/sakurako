@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -204,6 +205,26 @@ func TestLogsPanelOffersPauseAndFilters(t *testing.T) {
 			if !strings.Contains(r.Body.String(), needle) {
 				t.Errorf("%s: missing %s", path, needle)
 			}
+		}
+	}
+}
+
+func TestAppScriptReferencesExistingElements(t *testing.T) {
+	markup, err := uiFiles.ReadFile("ui/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := uiFiles.ReadFile("ui/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	references := regexp.MustCompile(`\$\(\s*'([^']+)'\s*\)`).FindAllStringSubmatch(string(script), -1)
+	if len(references) == 0 {
+		t.Fatal("no element lookups found in app.js")
+	}
+	for _, reference := range references {
+		if !strings.Contains(string(markup), `id="`+reference[1]+`"`) {
+			t.Errorf("app.js looks up #%s, which index.html does not define", reference[1])
 		}
 	}
 }
