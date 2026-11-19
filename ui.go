@@ -8,11 +8,13 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/multiverse2011/sakurako/internal/apidocs"
@@ -51,15 +53,22 @@ func contentETag(data []byte) string {
 	return fmt.Sprintf(`"%x"`, sha256.Sum256(data))
 }
 
+// gzipWriters recycles writers: one costs about 1 MiB, which is too much to
+// allocate for every compressed catalog response.
+var gzipWriters = sync.Pool{New: func() any { return gzip.NewWriter(io.Discard) }}
+
 func gzipBytes(data []byte) []byte {
 	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
+	zw := gzipWriters.Get().(*gzip.Writer)
+	zw.Reset(&buf)
 	if _, err := zw.Write(data); err != nil {
 		panic(err)
 	}
 	if err := zw.Close(); err != nil {
 		panic(err)
 	}
+	zw.Reset(io.Discard) // drop the reference to buf while the writer waits in the pool
+	gzipWriters.Put(zw)
 	return buf.Bytes()
 }
 

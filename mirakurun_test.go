@@ -598,9 +598,9 @@ func TestChannelConflictSourcesAreNotDuplicated(t *testing.T) {
 
 	// Map iteration order varies per call; a stale alias would duplicate a source.
 	for i := 0; i < 20; i++ {
-		g.mu.RLock()
+		g.mu.Lock()
 		cat := g.buildCatalog(time.Now())
-		g.mu.RUnlock()
+		g.mu.Unlock()
 		if len(cat.channelConflicts) != 1 {
 			t.Fatalf("pass %d: conflicts %v", i, cat.channelConflicts)
 		}
