@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -73,7 +74,7 @@ func TestUIStateStartingAndSharedClients(t *testing.T) {
 
 func TestUIRoutesAndMethodPolicy(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"))
-	for _, path := range []string{"/ui/", "/ui/style.css", "/ui/app.js", "/ui/favicon.svg", "/-/ui/state", "/-/ui/config", "/-/ui/logs"} {
+	for _, path := range []string{"/ui/", "/ui/style.css", "/ui/app.js", "/ui/favicon.svg", "/-/ui/state", "/-/ui/tuners", "/-/ui/config", "/-/ui/logs"} {
 		recorder := httptest.NewRecorder()
 		g.ServeHTTP(recorder, httptest.NewRequest("GET", path, nil))
 		if recorder.Code != 200 {
@@ -86,17 +87,104 @@ func TestUIRoutesAndMethodPolicy(t *testing.T) {
 	for _, tc := range []struct {
 		method, path string
 		status       int
-	}{{"POST", "/-/ui/state", 405}, {"GET", "/ui/missing", 404}, {"GET", "/", 307}, {"GET", "/ui", 307}} {
+	}{{"POST", "/-/ui/state", 405}, {"POST", "/-/ui/tuners", 405}, {"GET", "/ui/missing", 404}, {"GET", "/", 307}, {"GET", "/ui", 307}} {
 		r := httptest.NewRecorder()
 		g.ServeHTTP(r, httptest.NewRequest(tc.method, tc.path, nil))
 		if r.Code != tc.status {
 			t.Fatalf("%s %s: %d", tc.method, tc.path, r.Code)
 		}
 	}
-	r := httptest.NewRecorder()
-	g.ServeHTTP(r, httptest.NewRequest(http.MethodHead, "/ui/", nil))
-	if r.Body.Len() != 0 {
-		t.Fatal("HEAD served body")
+	for _, path := range []string{"/ui/", "/-/ui/tuners"} {
+		r := httptest.NewRecorder()
+		g.ServeHTTP(r, httptest.NewRequest(http.MethodHead, path, nil))
+		if r.Body.Len() != 0 {
+			t.Fatalf("HEAD %s served body", path)
+		}
+	}
+}
+
+func TestUITunerCounts(t *testing.T) {
+	free := object{"index": 1, "isAvailable": true, "isFault": false, "users": []object{}}
+	busy := object{"index": 2, "isAvailable": false, "isFault": false, "users": []object{{"id": "u1"}}}
+	faulty := object{"index": 3, "isAvailable": false, "isFault": true, "users": []object{}}
+	a, b, c := newFake(t, 10, "primary"), newFake(t, 10, "backup"), newFake(t, 10, "empty")
+	a.tuners = []object{free, busy}
+	b.tuners = []object{faulty, busy}
+	_, s := gateway(t, a, b, c)
+
+	var got struct {
+		Available bool `json:"available"`
+		InUse     int  `json:"in_use"`
+		Total     int  `json:"total"`
+		Free      int  `json:"free"`
+		Fault     int  `json:"fault"`
+		Backends  []struct {
+			ID    string `json:"id"`
+			InUse int    `json:"in_use"`
+			Total int    `json:"total"`
+			Free  int    `json:"free"`
+			Fault int    `json:"fault"`
+		} `json:"backends"`
+	}
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if !got.Available || got.InUse != 2 || got.Total != 4 || got.Free != 1 || got.Fault != 1 {
+		t.Fatalf("totals: %+v", got)
+	}
+	if len(got.Backends) != 3 {
+		t.Fatalf("want one row per answering backend: %+v", got.Backends)
+	}
+	if b := got.Backends[0]; b.ID != "region0" || b.InUse != 1 || b.Total != 2 || b.Free != 1 || b.Fault != 0 {
+		t.Fatalf("healthy backend: %+v", b)
+	}
+	// A faulty tuner is neither in use nor free.
+	if b := got.Backends[1]; b.ID != "region1" || b.InUse != 1 || b.Total != 2 || b.Free != 0 || b.Fault != 1 {
+		t.Fatalf("faulty backend: %+v", b)
+	}
+	// An empty list is still a successful answer, not a missing one.
+	if b := got.Backends[2]; b.ID != "region2" || b.Total != 0 || b.Free != 0 {
+		t.Fatalf("empty backend: %+v", b)
+	}
+
+	// One broken backend only drops its own row; the screen keeps the rest.
+	b.mu.Lock()
+	b.failTuners = 500
+	b.mu.Unlock()
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if !got.Available || got.InUse != 1 || got.Total != 2 || got.Free != 1 || got.Fault != 0 {
+		t.Fatalf("partial failure totals: %+v", got)
+	}
+	if len(got.Backends) != 2 || got.Backends[0].ID != "region0" || got.Backends[1].ID != "region2" {
+		t.Fatalf("partial failure rows: %+v", got.Backends)
+	}
+
+	a.mu.Lock()
+	a.failTuners = 500
+	a.mu.Unlock()
+	c.mu.Lock()
+	c.failTuners = 500
+	c.mu.Unlock()
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if got.Available || len(got.Backends) != 0 || got.InUse != 0 || got.Total != 0 || got.Free != 0 || got.Fault != 0 {
+		t.Fatalf("all failed should still answer 200 and say unavailable: %+v", got)
+	}
+}
+
+func TestUITunerCountsSkipsDisconnectedClient(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	g.ServeHTTP(recorder, httptest.NewRequest("GET", "/-/ui/tuners", nil).WithContext(ctx))
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("answered a disconnected client: %q", recorder.Body.String())
+	}
+}
+
+func TestCountTunersIsUsing(t *testing.T) {
+	// Mirakurun may report allocation only through isUsing.
+	inUse, total, free, fault := countTuners([]object{{"isUsing": true}, {"isAvailable": true}, {"isFault": true}})
+	if inUse != 1 || total != 3 || free != 1 || fault != 1 {
+		t.Fatalf("countTuners: %d %d %d %d", inUse, total, free, fault)
 	}
 }
 
