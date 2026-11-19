@@ -13,7 +13,7 @@
 /* One gateway boundary spans all shared-stream groups. */
 #flows{position:relative;isolation:isolate;padding:8px 0}#flows:has(.flow):before{content:"";position:absolute;z-index:-1;top:0;bottom:0;left:calc((100% - 136px) / 3.5 + 72px);width:calc((100% - 136px) * 1.5 / 3.5);border:1px solid #dcb4c4;border-radius:10px;background:#fbf3f7}.gateway{background:transparent;border:0;border-radius:0;padding:16px}.cols>span:nth-child(3){color:#9b4162;font-weight:700;font-size:15px;letter-spacing:0;text-transform:none}.flow{position:relative}.gateway .service{border-color:#e5cbd6}.sharing-label{color:#9b4162}
 @media(min-width:651px) and (max-width:800px){#flows:has(.flow):before{left:calc((100% - 60px) / 3.4 + 40px);width:calc((100% - 60px) * 1.4 / 3.4)}}
-@media(max-width:650px){#flows:has(.flow):before{display:none}#flows:has(.flow){border:1px solid #dcb4c4;border-radius:10px;background:#fbf3f7;padding:12px}#flows:has(.flow):after{content:"Sakurako · Stream routing";display:block;color:#9b4162;font-weight:600;padding:8px}.gateway{padding:12px 0}.flow{margin:12px 0}.node{background:white}}
+@media(max-width:650px){#flows:has(.flow):before{display:none}#flows:has(.flow){border:1px solid #dcb4c4;border-radius:10px;background:#fbf3f7;padding:12px;display:flex;flex-direction:column}#flows:has(.flow):after{content:"Sakurako · Stream routing";display:block;order:-1;color:#9b4162;font-weight:600;padding:8px}.gateway{padding:12px 0}.flow{margin:12px 0}.node{background:white}}
 
 /* SVG connectors use the measured card edges, including unequal card heights. */
 .arrow,.clients .node:before,.clients .node:after{visibility:hidden}.connections{position:absolute;inset:0;pointer-events:none;overflow:visible;z-index:2}.flow .node{position:relative;z-index:3}.upstream-link{padding:0;background:none;height:0}@media(max-width:650px){.connections,.upstream-link{display:none}}
@@ -26,7 +26,7 @@
 .server-label{position:absolute;top:12px;left:12px;max-width:calc((100% - 136px) / 3.5 - 24px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#49647d;font-size:12px;font-weight:600}
 .source-server .flow>.node{margin:0 12px;background:white}
 @media(min-width:651px) and (max-width:800px){.source-server:before{width:calc((100% - 60px) / 3.4)}.server-label{max-width:calc((100% - 60px) / 3.4 - 24px)}.source-server .flow>.node{margin:0 8px}}
-@media(max-width:650px){.source-server{padding:48px 10px 0;border:1px solid #bfd0df;border-radius:10px;background:#f3f7fb}.source-server:before{display:none}.server-label{max-width:calc(100% - 24px)}.source-server .flow>.node{margin:0}}
+@media(max-width:650px){.source-server{margin:12px 0;padding:48px 10px 0;border:1px solid #bfd0df;border-radius:10px;background:#f3f7fb}.source-server:before{display:none}.server-label{max-width:calc(100% - 24px)}.source-server .flow>.node{margin:0}}
 
 .backend-link{color:#49647d;text-decoration:none}.backend-link:hover{text-decoration:underline}.backend-link:focus-visible{outline:2px solid #b45577;outline-offset:3px}
 
@@ -36,7 +36,8 @@
 
 .auto-reload{margin-left:auto;display:flex;align-items:center;gap:9px;color:#606775;font-size:12px;cursor:pointer;white-space:nowrap}.auto-reload input{appearance:none;width:34px;height:20px;padding:2px;border:0;border-radius:12px;background:#b9c1cc;cursor:pointer;margin:0}.auto-reload input:before{content:"";display:block;width:16px;height:16px;border-radius:50%;background:white;transition:transform .15s}.auto-reload input:checked{background:#b45577}.auto-reload input:checked:before{transform:translateX(14px)}
 
-header nav{flex:1}.nav-link{margin-left:auto;font:inherit;padding:9px 15px;border-radius:6px;color:#606775;text-decoration:none;white-space:nowrap}.nav-link:hover{background:#f8e8ef;color:#a64064}.nav-link:focus-visible{outline:2px solid #b45577;outline-offset:3px}
+/* Keep the theme toggle on the first row and send the nav to its own second row. */
+header nav{flex:1}@media(max-width:650px){header nav{flex:1 0 100%;order:3;flex-wrap:wrap;gap:4px}header nav button,header nav .nav-link{padding:9px 10px}header nav .nav-link{margin-left:0}}.nav-link{margin-left:auto;font:inherit;padding:9px 15px;border-radius:6px;color:#606775;text-decoration:none;white-space:nowrap}.nav-link:hover{background:#f8e8ef;color:#a64064}.nav-link:focus-visible{outline:2px solid #b45577;outline-offset:3px}
 
 #log-lines{max-height:60vh;overflow:auto;margin:0;padding:14px 16px;background:var(--soft);border:1px solid var(--border);border-radius:7px;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 .log-line{padding:1px 0}
