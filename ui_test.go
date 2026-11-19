@@ -232,6 +232,7 @@ func TestUIManualRefreshControls(t *testing.T) {
 		{"/ui/", `id="refresh"`},
 		{"/ui/app.js", `$('refresh').addEventListener`},
 		{"/ui/app.js", `Auto reload paused`},
+		{"/ui/app.js", `pollTuners(true)`},
 	} {
 		recorder := httptest.NewRecorder()
 		g.ServeHTTP(recorder, httptest.NewRequest("GET", tc.path, nil))
