@@ -36,6 +36,12 @@
 
 .auto-reload{margin-left:auto;display:flex;align-items:center;gap:9px;color:#606775;font-size:12px;cursor:pointer;white-space:nowrap}.auto-reload input{appearance:none;width:34px;height:20px;padding:2px;border:0;border-radius:12px;background:#b9c1cc;cursor:pointer;margin:0}.auto-reload input:before{content:"";display:block;width:16px;height:16px;border-radius:50%;background:white;transition:transform .15s}.auto-reload input:checked{background:#b45577}.auto-reload input:checked:before{transform:translateX(14px)}
 
+#updated{font-size:12px;color:var(--muted,#858b96);font-variant-numeric:tabular-nums;white-space:nowrap}
+#updated.paused{color:#a17321;font-weight:600}
+#refresh{border:1px solid var(--border,#e1e4e9);border-radius:6px;background:var(--surface,#fff);padding:6px 12px;color:var(--muted,#606775);font-size:12px;white-space:nowrap}
+#refresh:hover{background:var(--accent-soft,#f8e8ef);color:var(--accent,#a64064)}
+#refresh:disabled{opacity:.5;cursor:default;background:var(--surface,#fff);color:var(--muted,#606775)}
+
 /* Keep the theme toggle on the first row and send the nav to its own second row. */
 header nav{flex:1}@media(max-width:650px){header nav{flex:1 0 100%;order:3;flex-wrap:wrap;gap:4px}header nav button,header nav .nav-link{padding:9px 10px}header nav .nav-link{margin-left:0}}.nav-link{margin-left:auto;font:inherit;padding:9px 15px;border-radius:6px;color:#606775;text-decoration:none;white-space:nowrap}.nav-link:hover{background:#f8e8ef;color:#a64064}.nav-link:focus-visible{outline:2px solid #b45577;outline-offset:3px}
 
