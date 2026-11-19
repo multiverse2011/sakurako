@@ -50,6 +50,13 @@ type catalog struct {
 	channelSources               map[string][]source // exposed channel type + "/" + channel name
 	conflicts                    []int64
 	channelConflicts             []channelConflict
+	// gen identifies this snapshot; response ETags are derived from it, so it
+	// changes whenever the snapshot may.
+	gen uint64
+	// programsJSON caches the encoded unfiltered program list. Copies of the
+	// catalog share the pointer, so the first request after a sync encodes and
+	// compresses it and later ones reuse that.
+	programsJSON *jsonBody
 	// expires is the instant after which a backend is no longer fresh without a
 	// sync (at exactly expires it still is). Zero means only a sync can change
 	// the catalog. buildCatalog sets it under mu
@@ -91,6 +98,34 @@ type Gateway struct {
 	cat                                       catalog
 	backends                                  []backend
 	catalogClient, streamClient, eventsClient *http.Client
+	gen                                       uint64 // guarded by mu, set by buildCatalog
+}
+
+// jsonBody is one response body, encoded on first use. gz stays nil when
+// compression does not pay off.
+type jsonBody struct {
+	once      sync.Once
+	plain, gz []byte
+	err       error
+}
+
+func (j *jsonBody) body(v any) (plain, gz []byte, err error) {
+	j.once.Do(func() {
+		if j.plain, j.err = encodeJSON(v); j.err != nil {
+			return
+		}
+		if z := gzipBytes(j.plain); len(z) < len(j.plain) {
+			j.gz = z
+		}
+	})
+	return j.plain, j.gz, j.err
+}
+
+// encodeJSON produces the body respond would write, newline included.
+func encodeJSON(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	err := json.NewEncoder(&buf).Encode(v)
+	return buf.Bytes(), err
 }
 
 func number(o object, key string) int64 {
@@ -358,7 +393,8 @@ func (g *Gateway) catalogNow(now time.Time) catalog {
 // responses depend only on local data and never on live backend requests. Called
 // with mu held, or by NewGateway before the gateway is shared.
 func (g *Gateway) buildCatalog(now time.Time) catalog {
-	c := catalog{services: []object{}, programs: []object{}, channels: []object{}, sources: map[int64][]source{}, channelSources: map[string][]source{}, conflicts: []int64{}, channelConflicts: []channelConflict{}}
+	g.gen++
+	c := catalog{gen: g.gen, programsJSON: &jsonBody{}, services: []object{}, programs: []object{}, channels: []object{}, sources: map[int64][]source{}, channelSources: map[string][]source{}, conflicts: []int64{}, channelConflicts: []channelConflict{}}
 	maxStale := time.Duration(g.config.MaxStaleSeconds) * time.Second
 	fresh := make([]bool, len(g.backends))
 	for i, b := range g.backends {

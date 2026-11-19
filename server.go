@@ -85,6 +85,59 @@ func apiError(w http.ResponseWriter, status int, reason string) {
 	respond(w, status, object{"code": status, "reason": reason})
 }
 
+// minGzipBytes is where compression starts to be attempted: a gzip writer costs
+// about 1 MiB of transient allocations, which a tiny detail response cannot pay
+// back.
+const minGzipBytes = 1 << 10
+
+// serveCatalog writes a catalog response with an ETag taken from the snapshot
+// generation and the request URI, a 304 when it still matches, and gzip when
+// the client accepts it. cached, when set, is the snapshot's encoded unfiltered
+// program list, which must not be re-encoded per request.
+func serveCatalog(w http.ResponseWriter, r *http.Request, gen uint64, v any, cached *jsonBody) {
+	etag := contentETag([]byte(fmt.Sprint(gen, " ", r.URL.RequestURI())))
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+		// A match needs no encoding and no compression.
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	wantGzip := acceptsGzip(r.Header.Get("Accept-Encoding"))
+	var plain, gz []byte
+	var err error
+	if cached != nil {
+		plain, gz, err = cached.body(v)
+	} else if plain, err = encodeJSON(v); err == nil && wantGzip && len(plain) >= minGzipBytes {
+		// Only compress when the result is actually smaller, as the UI assets do.
+		if z := gzipBytes(plain); len(z) < len(plain) {
+			gz = z
+		}
+	}
+	if err != nil {
+		log.Printf("catalog response encoding failed: %v", err)
+		apiError(w, 500, "response encoding failed")
+		return
+	}
+	data := plain
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Vary", "Accept-Encoding")
+	if gz != nil && wantGzip {
+		data = gz
+		w.Header().Set("Content-Encoding", "gzip")
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(200)
+		return
+	}
+	if _, err := w.Write(data); err != nil {
+		log.Printf("response write failed: %v", err)
+	}
+}
+
 // ServeHTTP routes catalog, stream, health, UI and OpenAPI requests.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" && r.Method != "HEAD" {
@@ -227,7 +280,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(parts) == 2 {
-		respond(w, 200, items)
+		var cached *jsonBody
+		if parts[1] == "programs" && r.URL.RawQuery == "" {
+			cached = cat.programsJSON
+		}
+		serveCatalog(w, r, cat.gen, items, cached)
 		return
 	}
 	if parts[1] == "channels" {
@@ -242,7 +299,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, item := range items {
 			if number(item, "id") == id {
-				respond(w, 200, item)
+				serveCatalog(w, r, cat.gen, item, nil)
 				return
 			}
 		}
