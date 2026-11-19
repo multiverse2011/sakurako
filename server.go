@@ -104,9 +104,11 @@ func apiError(w http.ResponseWriter, status int, reason string) {
 const minGzipBytes = 1 << 10
 
 // serveCatalog writes a catalog response with an ETag taken from the snapshot
-// generation, the request URI and the encoding, a 304 when it still matches,
-// and gzip when the client accepts it. cached, when set, is the snapshot's
-// encoded unfiltered program list, which must not be re-encoded per request.
+// generation, the request URI and the requested representation (gzip or
+// identity, decided from Accept-Encoding), a 304 when it still matches, and
+// gzip when the client accepts it and compression pays off. cached, when set,
+// is the snapshot's encoded unfiltered program list, which must not be
+// re-encoded per request.
 func serveCatalog(w http.ResponseWriter, r *http.Request, gen uint64, v any, cached *jsonBody) {
 	// The encoding follows from the request headers alone, so a 304 still needs
 	// no body. Each representation gets its own ETag, as the UI assets do.

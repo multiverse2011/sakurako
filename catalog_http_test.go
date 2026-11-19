@@ -158,13 +158,18 @@ func TestCatalogETagPerEncoding(t *testing.T) {
 	}
 }
 
-func TestCatalogETagDiffersAcrossRestarts(t *testing.T) {
+// TestCatalogETagDiffersAcrossGateways pins that the generation counter starts
+// from an instance-specific seed: two gateways serving the same catalog and URI
+// must not agree on an ETag. That is what keeps an ETag handed out by a
+// previous process from matching after a restart; the restart itself is not
+// observable from inside one process.
+func TestCatalogETagDiffersAcrossGateways(t *testing.T) {
 	_, first := gateway(t, bigCatalog(t))
 	_, second := gateway(t, bigCatalog(t))
 	a, _ := rawGet(t, "GET", first.URL+"/api/programs", "gzip", "")
 	b, _ := rawGet(t, "GET", second.URL+"/api/programs", "gzip", "")
 	if a.Header.Get("ETag") == b.Header.Get("ETag") {
-		t.Fatal("ETag repeats across restarts: a cache would serve 304 after the process came back with different data")
+		t.Fatal("two gateways over the same catalog share an ETag")
 	}
 }
 

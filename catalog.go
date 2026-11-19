@@ -98,7 +98,7 @@ type Gateway struct {
 	cat                                       catalog
 	backends                                  []backend
 	catalogClient, streamClient, eventsClient *http.Client
-	gen                                       uint64 // guarded by mu, set by buildCatalog
+	gen                                       uint64 // set by NewGateway before publication or by buildCatalog under mu
 }
 
 // jsonBody is one response body, encoded on first use. gz stays nil when
