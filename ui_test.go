@@ -118,6 +118,33 @@ func TestUIServiceTypeSurvivesVirtualChannel(t *testing.T) {
 	}
 }
 
+func TestUIServicesFilterMarkup(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	for _, path := range []string{"/ui/", "/ui/app.js"} {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		body := w.Body.String()
+		for _, needle := range []string{"service-type", "service-backend", "service-sort", "service-count"} {
+			if !strings.Contains(body, needle) {
+				t.Fatalf("%s: missing %s", path, needle)
+			}
+		}
+	}
+}
+
+func TestUISharedServiceListsEveryCandidate(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"), newFake(t, 10, "service"))
+	snapshot := g.uiState(time.Now())
+	services := snapshot["services"].([]object)
+	if len(services) != 1 {
+		t.Fatalf("shared services not merged: %v", services)
+	}
+	candidates := services[0]["candidates"].([]object)
+	if len(candidates) != 2 || candidates[0]["id"] != "region0" || candidates[1]["id"] != "region1" {
+		t.Fatalf("candidate list lost a backend: %v", candidates)
+	}
+}
+
 func TestMirakurunUIURL(t *testing.T) {
 	for input, want := range map[string]string{
 		"http://host:40772/api":   "http://host:40772/",
