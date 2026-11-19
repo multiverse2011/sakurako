@@ -280,6 +280,24 @@ func TestUIManualRefreshControls(t *testing.T) {
 	}
 }
 
+// The tab gating that keeps /-/ui/state and /-/ui/tuners idle on Logs and Settings is only wiring,
+// so pin it like the refresh controls above.
+func TestUIPollsOnlyTabsThatRenderState(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	recorder := httptest.NewRecorder()
+	g.ServeHTTP(recorder, httptest.NewRequest("GET", "/ui/app.js", nil))
+	for _, want := range []string{
+		`currentTab()==='overview'||currentTab()==='services'`,
+		`!tabPollsState()`,
+		`currentTab()!=='overview'`,
+		`if(tabPollsState()){render();poll();}`,
+	} {
+		if !strings.Contains(recorder.Body.String(), want) {
+			t.Errorf("/ui/app.js does not contain %s", want)
+		}
+	}
+}
+
 func TestUISharedServiceListsEveryCandidate(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"), newFake(t, 10, "service"))
 	snapshot := g.uiState(time.Now())
