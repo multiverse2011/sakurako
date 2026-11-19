@@ -432,10 +432,9 @@ func TestChannelConflictSurvivesExpiredWinner(t *testing.T) {
 		t.Fatalf("conflict not reported: %+v", h)
 	}
 
-	// The winner expires without a sync; the conflict must not be forgotten.
-	g.mu.Lock()
-	g.backends[0].updated = time.Now().Add(-2 * time.Minute)
-	g.mu.Unlock()
+	// Rewind the winner past max_stale as if no sync had happened; the catalog is
+	// republished the way Sync does, and the conflict must not be forgotten.
+	changeBackend(g, 0, func(b *backend) { b.updated = time.Now().Add(-2 * time.Minute) })
 	getJSON(t, s.URL+"/healthz", 503, &h)
 	if len(h.ChannelConflicts) != 1 || h.ChannelConflicts[0] != "GR/27" {
 		t.Fatalf("expired winner dropped the conflict: %+v", h)
@@ -464,9 +463,7 @@ func TestExpiredWinnerFailsOverToSameBroadcast(t *testing.T) {
 	a, b := newFake(t, 10, "A"), newFake(t, 10, "B")
 	g, s := sharedDomainGateway(t, "upstream", a, b)
 
-	g.mu.Lock()
-	g.backends[0].updated = time.Now().Add(-2 * time.Minute)
-	g.mu.Unlock()
+	changeBackend(g, 0, func(b *backend) { b.updated = time.Now().Add(-2 * time.Minute) })
 
 	var channels []object
 	getJSON(t, s.URL+"/api/channels", 200, &channels)
@@ -511,9 +508,7 @@ func TestChannelNameDoesNotFailOverAcrossServiceDomains(t *testing.T) {
 	t.Cleanup(s.Close)
 
 	// The priority winner expires; the other domain's same name must not take over.
-	g.mu.Lock()
-	g.backends[0].updated = time.Now().Add(-2 * time.Minute)
-	g.mu.Unlock()
+	changeBackend(g, 0, func(b *backend) { b.updated = time.Now().Add(-2 * time.Minute) })
 	var channels []object
 	getJSON(t, s.URL+"/api/channels", 200, &channels)
 	if len(channels) != 0 {
@@ -604,7 +599,7 @@ func TestChannelConflictSourcesAreNotDuplicated(t *testing.T) {
 	// Map iteration order varies per call; a stale alias would duplicate a source.
 	for i := 0; i < 20; i++ {
 		g.mu.RLock()
-		cat := g.snapshot(time.Now())
+		cat := g.buildCatalog(time.Now())
 		g.mu.RUnlock()
 		if len(cat.channelConflicts) != 1 {
 			t.Fatalf("pass %d: conflicts %v", i, cat.channelConflicts)

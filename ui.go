@@ -139,8 +139,8 @@ func (g *Gateway) serveUI(w http.ResponseWriter, r *http.Request) bool {
 // separate locks so catalog refresh never waits for JSON encoding or UI clients.
 func (g *Gateway) uiState(now time.Time) object {
 	backends, services, groups := []object{}, []object{}, []object{}
+	cat := g.catalogNow(now)
 	g.mu.RLock()
-	cat := g.snapshot(now)
 	maxStale := time.Duration(g.config.MaxStaleSeconds) * time.Second
 	for i := range g.backends {
 		b := &g.backends[i]

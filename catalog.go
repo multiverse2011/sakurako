@@ -50,6 +50,12 @@ type catalog struct {
 	channelSources               map[string][]source // exposed channel type + "/" + channel name
 	conflicts                    []int64
 	channelConflicts             []channelConflict
+	// expires is the instant after which a backend is no longer fresh without a
+	// sync (at exactly expires it still is). Zero means only a sync can change
+	// the catalog. buildCatalog sets it under mu
+	// like the rest of the catalog; copies it returns are read-only and not
+	// part of any response.
+	expires time.Time
 }
 
 // channelConflict is one exposed channel name that several broadcasts answer to.
@@ -78,10 +84,11 @@ type Gateway struct {
 	// mu guards all mutable backend state. config and base are fixed after
 	// NewGateway (tests only mutate them between requests); services, programs,
 	// updated, healthy, cooldowns and err are read and written under mu.
-	// len(backends) is fixed. Catalog objects handed out by snapshot are read-only.
+	// len(backends) is fixed. cat and the objects it hands out are read-only.
 	mu                                        sync.RWMutex
 	syncMu                                    sync.Mutex
 	loggedChannelConflicts                    string // guarded by syncMu
+	cat                                       catalog
 	backends                                  []backend
 	catalogClient, streamClient, eventsClient *http.Client
 }
@@ -281,15 +288,21 @@ func (g *Gateway) Sync(ctx context.Context) {
 		}(i)
 	}
 	wg.Wait()
-	g.logChannelConflicts()
+	// Publish the catalog once, after every backend has committed, so requests
+	// during a sync keep seeing the previous catalog. This holds while that
+	// catalog is fresh; if it has already expired, catalogNow rebuilds from
+	// whatever the in-flight sync has committed so far, as the old per-request
+	// assembly did.
+	g.mu.Lock()
+	cat := g.buildCatalog(time.Now())
+	g.cat = cat
+	g.mu.Unlock()
+	g.logChannelConflicts(cat)
 }
 
 // logChannelConflicts warns once per distinct set of conflicts, so a persistent
 // conflict is not repeated on every sync.
-func (g *Gateway) logChannelConflicts() {
-	g.mu.RLock()
-	cat := g.snapshot(time.Now())
-	g.mu.RUnlock()
+func (g *Gateway) logChannelConflicts(cat catalog) {
 	details := make([]string, 0, len(cat.channelConflicts))
 	for _, conflict := range cat.channelConflicts {
 		details = append(details, conflict.detail)
@@ -321,15 +334,41 @@ func (g *Gateway) Run(ctx context.Context) {
 	}
 }
 
-// Called under mu. Responses depend only on local snapshots, never live backend requests.
-func (g *Gateway) snapshot(now time.Time) catalog {
+// catalogNow returns the catalog committed by the last sync. Requests only pay to
+// copy it: it is rebuilt by Sync, or after a backend expires between syncs. The
+// comparison is strict to match buildCatalog, which keeps a backend at exactly
+// max_stale: rebuilding there would recompute the same expires on every request.
+func (g *Gateway) catalogNow(now time.Time) catalog {
+	g.mu.RLock()
+	c := g.cat
+	g.mu.RUnlock()
+	if c.expires.IsZero() || !now.After(c.expires) {
+		return c
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.cat.expires.IsZero() || !now.After(g.cat.expires) {
+		return g.cat // another request rebuilt it while this one waited
+	}
+	g.cat = g.buildCatalog(now)
+	return g.cat
+}
+
+// buildCatalog assembles the catalog from committed backend state as of now, so
+// responses depend only on local data and never on live backend requests. Called
+// with mu held, or by NewGateway before the gateway is shared.
+func (g *Gateway) buildCatalog(now time.Time) catalog {
 	c := catalog{services: []object{}, programs: []object{}, channels: []object{}, sources: map[int64][]source{}, channelSources: map[string][]source{}, conflicts: []int64{}, channelConflicts: []channelConflict{}}
+	maxStale := time.Duration(g.config.MaxStaleSeconds) * time.Second
 	fresh := make([]bool, len(g.backends))
 	for i, b := range g.backends {
-		if b.updated.IsZero() || now.Sub(b.updated) > time.Duration(g.config.MaxStaleSeconds)*time.Second {
+		if b.updated.IsZero() || now.Sub(b.updated) > maxStale {
 			continue
 		}
 		fresh[i] = true
+		if until := b.updated.Add(maxStale); c.expires.IsZero() || until.Before(c.expires) {
+			c.expires = until
+		}
 		for _, s := range b.services {
 			id := number(s, "id")
 			c.sources[id] = append(c.sources[id], source{i, s})

@@ -263,6 +263,15 @@ func gatewayWithCatalogTimeout(t *testing.T, catalogSeconds int, fs ...*fakeBack
 	t.Cleanup(s.Close)
 	return g, s
 }
+
+// changeBackend edits backend i and republishes the catalog the way Sync does,
+// so tests can simulate a time or config change without a real sync.
+func changeBackend(g *Gateway, i int, fn func(*backend)) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	fn(&g.backends[i])
+	g.cat = g.buildCatalog(time.Now())
+}
 func getJSON(t *testing.T, url string, status int, v any) {
 	t.Helper()
 	resp, err := testClient.Get(url)
@@ -438,9 +447,7 @@ func TestFailureAndRecovery(t *testing.T) {
 	getJSON(t, s.URL+"/api/services", 200, new([]object))
 	getJSON(t, s.URL+"/healthz", 503, nil)
 	getJSON(t, s.URL+"/api/services/1000101/stream", 503, nil)
-	g.mu.Lock()
-	g.backends[0].updated = time.Now().Add(-2 * time.Minute)
-	g.mu.Unlock()
+	changeBackend(g, 0, func(b *backend) { b.updated = time.Now().Add(-2 * time.Minute) })
 	var services []object
 	getJSON(t, s.URL+"/api/services", 200, &services)
 	if len(services) != 0 {
@@ -459,9 +466,7 @@ func TestFailureAndRecovery(t *testing.T) {
 func TestIdentityConflict(t *testing.T) {
 	a, b := newFake(t, 10, "different"), newFake(t, 10, "broadcast")
 	g, s := gateway(t, a, b)
-	g.mu.Lock()
-	g.backends[1].config.ServiceDomain = "different-domain"
-	g.mu.Unlock()
+	changeBackend(g, 1, func(b *backend) { b.config.ServiceDomain = "different-domain" })
 	var services, programs []object
 	getJSON(t, s.URL+"/api/services", 200, &services)
 	getJSON(t, s.URL+"/api/programs", 200, &programs)
