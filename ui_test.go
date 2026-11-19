@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -189,6 +190,43 @@ func TestCountTunersIsUsing(t *testing.T) {
 	inUse, total, free, fault := countTuners([]object{{"isUsing": true}, {"isAvailable": true}, {"isFault": true}})
 	if inUse != 1 || total != 3 || free != 1 || fault != 1 {
 		t.Fatalf("countTuners: %d %d %d %d", inUse, total, free, fault)
+	}
+}
+
+func TestLogsPanelOffersPauseAndFilters(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	for path, needles := range map[string][]string{
+		"/ui/":       {`id="log-pause"`, `id="log-query"`, `id="log-backend"`},
+		"/ui/app.js": {`'log-pause'`, `'log-query'`, `'log-backend'`, `logPaused`},
+	} {
+		r := httptest.NewRecorder()
+		g.ServeHTTP(r, httptest.NewRequest("GET", path, nil))
+		for _, needle := range needles {
+			if !strings.Contains(r.Body.String(), needle) {
+				t.Errorf("%s: missing %s", path, needle)
+			}
+		}
+	}
+}
+
+// The test assumes every element app.js looks up with $() is present in index.html's static markup.
+func TestAppScriptReferencesExistingElements(t *testing.T) {
+	markup, err := uiFiles.ReadFile("ui/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := uiFiles.ReadFile("ui/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	references := regexp.MustCompile(`\$\(\s*'([^']+)'\s*\)`).FindAllStringSubmatch(string(script), -1)
+	if len(references) == 0 {
+		t.Fatal("no element lookups found in app.js")
+	}
+	for _, reference := range references {
+		if !strings.Contains(string(markup), `id="`+reference[1]+`"`) {
+			t.Errorf("app.js looks up #%s, which index.html does not define", reference[1])
+		}
 	}
 }
 

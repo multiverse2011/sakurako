@@ -50,3 +50,4 @@ header nav{flex:1}@media(max-width:650px){header nav{flex:1 0 100%;order:3;flex-
 #settings-config th{width:220px;color:var(--muted);font-weight:400}
 
 .tuner-fault{color:#a1313b;font-weight:600}
+.log-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}#log-query{width:220px}
