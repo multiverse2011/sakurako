@@ -280,6 +280,37 @@ func TestUIManualRefreshControls(t *testing.T) {
 	}
 }
 
+// Automatic state polling is gated to Overview/Services, tuner polling and redrawing to the
+// visible tab. That wiring is the point of the change but has no JS runner here, so pin it like
+// the refresh controls above, ignoring whitespace so reformatting app.js does not break the pins.
+func TestUIRendersAndPollsPerVisibleTab(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	recorder := httptest.NewRecorder()
+	g.ServeHTTP(recorder, httptest.NewRequest("GET", "/ui/app.js", nil))
+	script := strings.Join(strings.Fields(recorder.Body.String()), "")
+	for _, want := range []string{
+		`document.querySelector('main>section:not(.hidden)')?.id||'overview'`,
+		`['overview','services'].includes(currentTab())`,
+		`currentTab()==='overview'`,
+		`if(currentTab()==='overview')renderOverview();elseif(currentTab()==='services')renderServices()`,
+		`if(tabPollsState()){render();poll();}`,
+		`&&tabPollsState())timer=setTimeout(poll,`,
+		`else{$('connection').textContent='';$('connection').classList.remove('status-error');}`,
+		`if(!state)poll(true);elsepoll();`,
+		`elsepollTuners();`,
+		`||!tabPollsTuners()`,
+		`if(state&&tabPollsTuners()){renderTuners();renderBackends();}`,
+		`&&tabPollsTuners())tunerTimer=setTimeout(pollTuners,5000)`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("/ui/app.js does not contain %s", want)
+		}
+	}
+	if strings.Contains(script, `renderOverview();renderServices()`) {
+		t.Error("/ui/app.js redraws both tabs on every state poll")
+	}
+}
+
 func TestUISharedServiceListsEveryCandidate(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"), newFake(t, 10, "service"))
 	snapshot := g.uiState(time.Now())
