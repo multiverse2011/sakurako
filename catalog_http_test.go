@@ -220,14 +220,14 @@ func TestStreamsAreNotCompressed(t *testing.T) {
 	}
 	channel.Body.Close()
 
-	req, _ = http.NewRequest("GET", s.URL+"/api/events/stream", nil)
+	req, _ = http.NewRequest("GET", s.URL+"/api/events/stream?resource=tuner", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 	events, err := rawClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if events.Header.Get("Content-Encoding") != "" {
-		t.Fatal("event stream was compressed")
+	if events.StatusCode != 200 || events.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("event stream HTTP %d, Content-Encoding %q", events.StatusCode, events.Header.Get("Content-Encoding"))
 	}
 	events.Body.Close()
 }
