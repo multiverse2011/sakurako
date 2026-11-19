@@ -297,6 +297,7 @@ func TestUIRendersAndPollsPerVisibleTab(t *testing.T) {
 		`&&tabPollsState())timer=setTimeout(poll,`,
 		`else{$('connection').textContent='';$('connection').classList.remove('status-error');}`,
 		`if(!state)poll(true);elsepoll();`,
+		`elsepollTuners();`,
 		`||!tabPollsTuners()`,
 		`if(state&&tabPollsTuners()){renderTuners();renderBackends();}`,
 		`&&tabPollsTuners())tunerTimer=setTimeout(pollTuners,5000)`,
