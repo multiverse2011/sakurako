@@ -146,6 +146,13 @@ func BenchmarkProgramsAll(b *testing.B) {
 	benchGet(b, s.URL+"/api/programs")
 }
 
+// BenchmarkProgramsFiltered guards that a filtered request encodes only the
+// matching programs, not the whole catalog.
+func BenchmarkProgramsFiltered(b *testing.B) {
+	_, s := benchCatalog(b)
+	benchGet(b, s.URL+"/api/programs?serviceId=1024")
+}
+
 func BenchmarkChannels(b *testing.B) {
 	_, s := benchCatalog(b)
 	benchGet(b, s.URL+"/api/channels")

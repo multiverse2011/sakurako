@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +27,9 @@ func (c *idleConn) Read(p []byte) (int, error) {
 	}
 	return c.Conn.Read(p)
 }
+
+// gatewaySeq separates gateways created within the same clock tick.
+var gatewaySeq atomic.Uint64
 
 // NewGateway validates c and parses each backend URL once into a Gateway.
 func NewGateway(c Config) (*Gateway, error) {
@@ -65,6 +69,9 @@ func NewGateway(c Config) (*Gateway, error) {
 		}
 		g.backends = append(g.backends, backend{config: b, base: base, blockedServices: map[int64]time.Time{}})
 	}
+	// Start the generation counter at the process's clock, so an ETag from a
+	// previous run can never match this one.
+	g.gen = uint64(time.Now().UnixNano()) + gatewaySeq.Add(1)
 	g.cat = g.buildCatalog(time.Now()) // empty until the first sync
 	return g, nil
 }
@@ -72,11 +79,17 @@ func respond(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, context.Canceled) {
-			return
-		}
-		log.Printf("response write failed: %v", err)
+		logWriteError(err)
 	}
+}
+
+// logWriteError reports a failed response write; a client that simply went away
+// is not an error.
+func logWriteError(err error) {
+	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, context.Canceled) {
+		return
+	}
+	log.Printf("response write failed: %v", err)
 }
 func apiError(w http.ResponseWriter, status int, reason string) {
 	if status >= 500 {
@@ -85,26 +98,32 @@ func apiError(w http.ResponseWriter, status int, reason string) {
 	respond(w, status, object{"code": status, "reason": reason})
 }
 
-// minGzipBytes is where compression starts to be attempted: a gzip writer costs
-// about 1 MiB of transient allocations, which a tiny detail response cannot pay
-// back.
+// minGzipBytes is where compression starts to be attempted: a body this small
+// cannot shrink enough to pay for the attempt, and shipping it uncompressed
+// keeps the response a straight copy.
 const minGzipBytes = 1 << 10
 
 // serveCatalog writes a catalog response with an ETag taken from the snapshot
-// generation and the request URI, a 304 when it still matches, and gzip when
-// the client accepts it. cached, when set, is the snapshot's encoded unfiltered
-// program list, which must not be re-encoded per request.
+// generation, the request URI and the encoding, a 304 when it still matches,
+// and gzip when the client accepts it. cached, when set, is the snapshot's
+// encoded unfiltered program list, which must not be re-encoded per request.
 func serveCatalog(w http.ResponseWriter, r *http.Request, gen uint64, v any, cached *jsonBody) {
-	etag := contentETag([]byte(fmt.Sprint(gen, " ", r.URL.RequestURI())))
+	// The encoding follows from the request headers alone, so a 304 still needs
+	// no body. Each representation gets its own ETag, as the UI assets do.
+	variant := "identity"
+	if acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		variant = "gzip"
+	}
+	etag := contentETag([]byte(fmt.Sprint(gen, " ", variant, " ", r.URL.RequestURI())))
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Vary", "Accept-Encoding")
 	if etagMatches(r.Header.Get("If-None-Match"), etag) {
 		// A match needs no encoding and no compression.
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("ETag", etag)
-		w.Header().Set("Vary", "Accept-Encoding")
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	wantGzip := acceptsGzip(r.Header.Get("Accept-Encoding"))
+	wantGzip := variant == "gzip"
 	var plain, gz []byte
 	var err error
 	if cached != nil {
@@ -121,9 +140,6 @@ func serveCatalog(w http.ResponseWriter, r *http.Request, gen uint64, v any, cac
 		return
 	}
 	data := plain
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("ETag", etag)
-	w.Header().Set("Vary", "Accept-Encoding")
 	if gz != nil && wantGzip {
 		data = gz
 		w.Header().Set("Content-Encoding", "gzip")
@@ -134,7 +150,7 @@ func serveCatalog(w http.ResponseWriter, r *http.Request, gen uint64, v any, cac
 		return
 	}
 	if _, err := w.Write(data); err != nil {
-		log.Printf("response write failed: %v", err)
+		logWriteError(err)
 	}
 }
 

@@ -57,6 +57,8 @@ func bigCatalog(t *testing.T) *fakeBackend {
 
 func TestCatalogGzip(t *testing.T) {
 	_, s := gateway(t, bigCatalog(t))
+	// The fixture has a single service, so /api/services and /api/channels stay
+	// under minGzipBytes and must be served identity to an accepting client.
 	for _, path := range []string{"/api/programs", "/api/programs?serviceId=101", "/api/programs/100010100003", "/api/services", "/api/channels"} {
 		gzResp, gzBody := rawGet(t, "GET", s.URL+path, "gzip", "")
 		plainResp, plainBody := rawGet(t, "GET", s.URL+path, "", "")
@@ -130,6 +132,42 @@ func TestCatalogETagAndNotModified(t *testing.T) {
 	}
 }
 
+func TestCatalogETagPerEncoding(t *testing.T) {
+	_, s := gateway(t, bigCatalog(t))
+	for _, path := range []string{"/api/programs", "/api/programs?serviceId=101"} {
+		etags := map[string]string{}
+		for _, accept := range []string{"", "gzip"} {
+			resp, _ := rawGet(t, "GET", s.URL+path, accept, "")
+			etag := resp.Header.Get("ETag")
+			if resp.StatusCode != 200 || etag == "" {
+				t.Fatalf("%s accept %q: %d ETag %q", path, accept, resp.StatusCode, etag)
+			}
+			etags[accept] = etag
+			if nm, body := rawGet(t, "GET", s.URL+path, accept, etag); nm.StatusCode != http.StatusNotModified || len(body) != 0 {
+				t.Fatalf("%s accept %q: revalidation %d body %d", path, accept, nm.StatusCode, len(body))
+			}
+		}
+		// Whenever two representations are served, their ETags must differ.
+		if etags[""] == etags["gzip"] {
+			t.Fatalf("%s: encodings share an ETag %q", path, etags[""])
+		}
+		// A client holding the identity body must not get a 304 for the gzip variant.
+		if resp, _ := rawGet(t, "GET", s.URL+path, "gzip", etags[""]); resp.StatusCode != 200 {
+			t.Fatalf("%s: identity ETag answered a gzip request with %d", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestCatalogETagDiffersAcrossRestarts(t *testing.T) {
+	_, first := gateway(t, bigCatalog(t))
+	_, second := gateway(t, bigCatalog(t))
+	a, _ := rawGet(t, "GET", first.URL+"/api/programs", "gzip", "")
+	b, _ := rawGet(t, "GET", second.URL+"/api/programs", "gzip", "")
+	if a.Header.Get("ETag") == b.Header.Get("ETag") {
+		t.Fatal("ETag repeats across restarts: a cache would serve 304 after the process came back with different data")
+	}
+}
+
 func TestCatalogHead(t *testing.T) {
 	_, s := gateway(t, bigCatalog(t))
 	get, body := rawGet(t, "GET", s.URL+"/api/programs", "gzip", "")
@@ -157,11 +195,25 @@ func TestStreamsAreNotCompressed(t *testing.T) {
 	if resp.StatusCode != 200 || resp.Header.Get("Content-Encoding") != "" {
 		t.Fatalf("stream HTTP %d, Content-Encoding %q", resp.StatusCode, resp.Header.Get("Content-Encoding"))
 	}
-	buf := make([]byte, len("transport-stream"))
-	if _, err := io.ReadFull(resp.Body, buf); err != nil || string(buf) != "transport-stream" {
-		t.Fatalf("stream body %q: %v", buf, err)
+	if body := readStreamBody(t, resp); body != "transport-stream" {
+		t.Fatalf("stream body %q", body)
 	}
 	resp.Body.Close()
+
+	// The channel stream that tuning clients use for EPG scans is untouched too.
+	req, _ = http.NewRequest("GET", s.URL+"/api/channels/GR/"+channelByName(t, s, 10)+"/stream", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	channel, err := rawClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.StatusCode != 200 || channel.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("channel stream HTTP %d, Content-Encoding %q", channel.StatusCode, channel.Header.Get("Content-Encoding"))
+	}
+	if body := readStreamBody(t, channel); body != "transport-stream" {
+		t.Fatalf("channel stream body %q", body)
+	}
+	channel.Body.Close()
 
 	req, _ = http.NewRequest("GET", s.URL+"/api/events/stream", nil)
 	req.Header.Set("Accept-Encoding", "gzip")

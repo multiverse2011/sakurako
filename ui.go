@@ -67,6 +67,7 @@ func gzipBytes(data []byte) []byte {
 	if err := zw.Close(); err != nil {
 		panic(err)
 	}
+	zw.Reset(io.Discard) // drop the reference to buf while the writer waits in the pool
 	gzipWriters.Put(zw)
 	return buf.Bytes()
 }

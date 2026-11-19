@@ -109,6 +109,8 @@ type jsonBody struct {
 	err       error
 }
 
+// body encodes only the first v it is given; later callers get that result and
+// must pass the same value.
 func (j *jsonBody) body(v any) (plain, gz []byte, err error) {
 	j.once.Do(func() {
 		if j.plain, j.err = encodeJSON(v); j.err != nil {
