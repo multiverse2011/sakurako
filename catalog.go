@@ -392,8 +392,9 @@ func (g *Gateway) catalogNow(now time.Time) catalog {
 }
 
 // buildCatalog assembles the catalog from committed backend state as of now, so
-// responses depend only on local data and never on live backend requests. Called
-// with mu held, or by NewGateway before the gateway is shared.
+// responses depend only on local data and never on live backend requests. It
+// advances the generation counter, so callers must hold the write lock
+// (mu.Lock) — or be NewGateway before the gateway is shared.
 func (g *Gateway) buildCatalog(now time.Time) catalog {
 	g.gen++
 	c := catalog{gen: g.gen, programsJSON: &jsonBody{}, services: []object{}, programs: []object{}, channels: []object{}, sources: map[int64][]source{}, channelSources: map[string][]source{}, conflicts: []int64{}, channelConflicts: []channelConflict{}}
