@@ -43,10 +43,12 @@
 #refresh:disabled{opacity:.5;cursor:default;background:var(--surface,#fff);color:var(--muted,#606775)}
 
 header nav{flex:1}
-/* 654px rounds up the desktop row’s measured right edge (805.39px) minus 72px of header padding and two 40px gaps. */
-@media(width > 800px){header{column-gap:min(40px,calc((100% - 654px) / 2))}}
-/* On main the narrow header ends at 737.39px; with a 15px scrollbar, scrollWidth equals clientWidth starting at 752px. */
-@media(width < 752px){
+/* The desktop row needs 689.39px before gaps and padding. Subtract the 36px left padding and round up to 654px. */
+/* Use some right padding at 801–805px (through 820px with a 15px scrollbar). Restore main's 40px gaps at 806px of client width. */
+@media(min-width:801px){header{column-gap:min(40px,calc((100% - 654px) / 2))}}
+/* #27: measured in Chrome on macOS with a 15px scrollbar. At 752px the 737.39px right edge rounds to the integer clientWidth of 737px. */
+/* Keep the theme toggle on the first row and send the nav to its own second row. */
+@media(max-width:751px){
   header{height:auto;min-height:64px;flex-wrap:wrap;padding:12px 18px;gap:12px}
   header nav{flex:1 0 100%;order:3;flex-wrap:wrap;gap:4px}
   header nav button,header nav .nav-link{padding:9px 10px}
