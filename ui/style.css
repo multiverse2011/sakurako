@@ -6,7 +6,7 @@
 /* Keep controls readable in English and flow branches inside their grid tracks. */
 #search{width:260px;max-width:100%}.node>div{min-width:0}.node>.detail{flex-shrink:0}.node>small{white-space:nowrap}.heading{gap:16px}.table td{overflow-wrap:anywhere}.metric strong{font-variant-numeric:tabular-nums}nav{flex-shrink:0}.clients .node:before{top:50%}.flow>.arrow:nth-child(4){width:50%}.flow>.arrow:nth-child(4):after{display:none}
 @media(min-width:651px) and (max-width:800px){.clients .node:before{left:-11px;width:10px}.clients .node:after{left:-11px}}
-@media(max-width:650px){header{height:auto;min-height:64px;flex-wrap:wrap;padding:12px 18px;gap:12px}b.logo{font-size:21px}.metric:nth-child(2n){border-right:0}.node{display:flex}.flow .service{flex-wrap:wrap}.table{min-width:520px}#search{width:100%}.heading input{flex-basis:100%}}
+@media(max-width:650px){b.logo{font-size:21px}.metrics{overflow-wrap:anywhere}.metric:nth-child(2n){border-right:0}.node{display:flex}.flow .service{flex-wrap:wrap}.table{min-width:520px}#search{width:100%}.heading input{flex-basis:100%}}
 
 .gateway{background:#fbf3f7;border:1px solid #dcb4c4;border-radius:10px;padding:14px;min-width:0}.gateway-label{font-size:12px;font-weight:700;letter-spacing:.04em;color:#9b4162;margin-bottom:7px}.sharing-label{font-size:13px;font-weight:600;margin-bottom:12px}.gateway .service{background:white}.stream-settings{font-size:11px;color:#704d5b;margin-top:12px;line-height:1.6}.upstream-link{font-size:10px;color:#777;white-space:nowrap;text-align:center;line-height:1;display:flex;align-items:flex-end;padding-bottom:8px}.metric #stream-count{font-size:19px;line-height:1.6}.cols,.flow{grid-template-columns:minmax(0,1fr) 72px minmax(0,1.5fr) 64px minmax(0,1fr)}@media(max-width:800px){.cols,.flow{grid-template-columns:minmax(0,1fr) 40px minmax(0,1.4fr) 20px minmax(0,1fr)}.upstream-link{font-size:9px;white-space:normal}}@media(max-width:650px){.upstream-link{display:block;height:auto;background:none;text-align:left;padding:0}.upstream-link:after{display:none}.gateway{padding:14px}.metric #stream-count{font-size:16px}}
 
@@ -42,8 +42,19 @@
 #refresh:hover{background:var(--accent-soft,#f8e8ef);color:var(--accent,#a64064)}
 #refresh:disabled{opacity:.5;cursor:default;background:var(--surface,#fff);color:var(--muted,#606775)}
 
+header nav{flex:1}
+/* The desktop row needs 689.39px before gaps and padding. Subtract the 36px left padding and round up to 654px. */
+/* Use some right padding at 801–805px (through 820px with a 15px scrollbar). Restore main's 40px gaps at 806px of client width. */
+@media(min-width:801px){header{column-gap:min(40px,calc((100% - 654px) / 2))}}
+/* #27: measured in Chrome on macOS with a 15px scrollbar. At 752px the 737.39px right edge rounds to the integer clientWidth of 737px. */
 /* Keep the theme toggle on the first row and send the nav to its own second row. */
-header nav{flex:1}@media(max-width:650px){header nav{flex:1 0 100%;order:3;flex-wrap:wrap;gap:4px}header nav button,header nav .nav-link{padding:9px 10px}header nav .nav-link{margin-left:0}}.nav-link{margin-left:auto;font:inherit;padding:9px 15px;border-radius:6px;color:#606775;text-decoration:none;white-space:nowrap}.nav-link:hover{background:#f8e8ef;color:#a64064}.nav-link:focus-visible{outline:2px solid #b45577;outline-offset:3px}
+@media(max-width:751px){
+  header{height:auto;min-height:64px;flex-wrap:wrap;padding:12px 18px;gap:12px}
+  header nav{flex:1 0 100%;order:3;flex-wrap:wrap;gap:4px}
+  header nav button,header nav .nav-link{padding:9px 10px}
+  header nav .nav-link{margin-left:0}
+}
+.nav-link{margin-left:auto;font:inherit;padding:9px 15px;border-radius:6px;color:#606775;text-decoration:none;white-space:nowrap}.nav-link:hover{background:#f8e8ef;color:#a64064}.nav-link:focus-visible{outline:2px solid #b45577;outline-offset:3px}
 
 #log-lines{max-height:60vh;overflow:auto;margin:0;padding:14px 16px;background:var(--soft);border:1px solid var(--border);border-radius:7px;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 .log-line{padding:1px 0}
