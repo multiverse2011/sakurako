@@ -47,12 +47,8 @@ header nav{flex:1}
 .brand{display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap}
 #version{font-size:13px;color:var(--muted);white-space:nowrap}
 .update-link{font-size:12px;color:var(--accent);text-decoration:none;white-space:nowrap}.update-link:hover{text-decoration:underline}
-/* The desktop row needs 689.39px before gaps and padding. Subtract the 36px left padding and round up to 654px. */
-/* Use some right padding at 801–805px (through 820px with a 15px scrollbar). Restore main's 40px gaps at 806px of client width. */
-@media(min-width:801px){header{column-gap:min(40px,calc((100% - 654px) / 2))}}
-/* #27: measured in Chrome on macOS with a 15px scrollbar. At 752px the 737.39px right edge rounds to the integer clientWidth of 737px. */
-/* Keep the theme toggle on the first row and send the nav to its own second row. */
-@media(max-width:751px){
+/* With the version and update link the brand needs about 890px of client width; measured in Chrome, 901px window / 886px client is the first width that fits, so the nav moves to its own second row below that. */
+@media(max-width:900px){
   header{height:auto;min-height:64px;flex-wrap:wrap;padding:12px 18px;gap:12px}
   header nav{flex:1 0 100%;order:3;flex-wrap:wrap;gap:4px}
   header nav button,header nav .nav-link{padding:9px 10px}

@@ -562,6 +562,9 @@ func TestUIManualRefreshControls(t *testing.T) {
 		{"/ui/app.js", `$('refresh').addEventListener`},
 		{"/ui/app.js", `Auto reload paused`},
 		{"/ui/app.js", `pollTuners(true)`},
+		{"/ui/app.js", `renderHeader(next);render()`},
+		{"/ui/app.js", `link.href=update.url`},
+		{"/ui/app.js", "Update available ("},
 	} {
 		recorder := httptest.NewRecorder()
 		g.ServeHTTP(recorder, httptest.NewRequest("GET", tc.path, nil))
