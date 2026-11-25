@@ -15,7 +15,15 @@ import (
 	"time"
 )
 
-const subscriberQueueSize = 16 // At most 512 KiB of pending chunks per subscriber.
+// subscriberQueueBytes bounds how far a slow subscriber may fall behind: about
+// 5 seconds at BS 24 Mbps. Only exceeding it drops a subscriber; a longer stall
+// is cut by the subscriber's own write deadline (stream_timeout_seconds).
+const subscriberQueueBytes = 16 << 20
+
+// subscriberQueueChunks bounds the pending chunk count for reads smaller than
+// the 32 KiB upstream buffer; the byte limit is the real bound.
+const subscriberQueueChunks = subscriberQueueBytes / (32 << 10)
+
 type streamKey struct {
 	id                                    int64  // service stream
 	channel                               string // exposed channel name; empty for service streams
@@ -34,6 +42,7 @@ type subscriber struct {
 	remote, userAgent string
 	joined            time.Time
 	bytes             atomic.Int64
+	queued            atomic.Int64 // bytes buffered in chunks, written and read concurrently
 
 	chunks  chan []byte
 	dropped chan struct{}
@@ -58,7 +67,7 @@ type sharedStream struct {
 }
 
 func newSubscriber() *subscriber {
-	return &subscriber{chunks: make(chan []byte, subscriberQueueSize), dropped: make(chan struct{})}
+	return &subscriber{chunks: make(chan []byte, subscriberQueueChunks), dropped: make(chan struct{})}
 }
 
 func newSharedStream(g *Gateway, id string, key streamKey, serviceName string, cancel context.CancelFunc) *sharedStream {
@@ -168,6 +177,7 @@ func (g *Gateway) openSharedStream(w http.ResponseWriter, r *http.Request, key s
 				}
 				return
 			}
+			sub.queued.Add(-int64(len(chunk)))
 			if err := controller.SetWriteDeadline(time.Now().Add(timeout)); err != nil && !warned {
 				warned = true
 				log.Printf("write deadline unsupported, slow clients are not bounded: %v", err)
@@ -310,6 +320,11 @@ func (s *sharedStream) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	s.offset += int64(len(p))
 	var dropped []*subscriber
+	drop := func(sub *subscriber) {
+		dropped = append(dropped, sub)
+		close(sub.dropped)
+		delete(s.subscribers, sub)
+	}
 	for sub := range s.subscribers {
 		data := chunk
 		if s.status == http.StatusOK && sub.skip > 0 {
@@ -320,12 +335,17 @@ func (s *sharedStream) Write(p []byte) (int, error) {
 				continue
 			}
 		}
+		if sub.queued.Add(int64(len(data))) > subscriberQueueBytes {
+			sub.queued.Add(-int64(len(data)))
+			drop(sub)
+			continue
+		}
 		select {
 		case sub.chunks <- data:
 		default:
-			dropped = append(dropped, sub)
-			close(sub.dropped)
-			delete(s.subscribers, sub)
+			// Chunk-count safety net for many tiny reads.
+			sub.queued.Add(-int64(len(data)))
+			drop(sub)
 		}
 	}
 	empty := len(s.subscribers) == 0

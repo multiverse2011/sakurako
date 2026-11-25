@@ -117,7 +117,7 @@ func TestSharedStreamLifecycleAndOptions(t *testing.T) {
 	}
 }
 
-func TestSharedFanoutSlowSubscriberAndAlignment(t *testing.T) {
+func TestSharedSlowSubscriberSurvivesShortStalls(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fast := newSubscriber()
@@ -125,19 +125,55 @@ func TestSharedFanoutSlowSubscriberAndAlignment(t *testing.T) {
 	s := newSharedStream(nil, "s", streamKey{}, "", cancel)
 	s.subscribers[fast] = true
 	s.subscribers[slow] = true
-	for i := 0; i < subscriberQueueSize+1; i++ {
+	chunk := make([]byte, 32<<10)
+	drain := func() { // mirrors the subscriber reader's accounting
+		fast.queued.Add(-int64(len(<-fast.chunks)))
+	}
+	for sent := 0; sent < subscriberQueueBytes; sent += len(chunk) {
+		if _, err := s.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		drain()
+		// Past 512 KiB (the old 16-chunk queue) but under the byte limit, a stall
+		// of a few seconds must not disconnect.
+		if sent >= 512<<10 {
+			select {
+			case <-slow.dropped:
+				t.Fatalf("dropped after %d bytes, below the %d byte limit", sent+len(chunk), subscriberQueueBytes)
+			default:
+			}
+		}
+	}
+	select {
+	case <-slow.dropped:
+		t.Fatal("slow subscriber not disconnected above the byte limit")
+	default:
+	}
+	if _, err := s.Write(chunk); err != nil {
+		t.Fatal(err)
+	}
+	drain()
+	select {
+	case <-slow.dropped:
+	default:
+		t.Fatal("slow subscriber not disconnected above the byte limit")
+	}
+	if ctx.Err() != nil {
+		t.Fatal("slow subscriber canceled healthy stream")
+	}
+}
+
+func TestSharedLateJoinAlignment(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fast := newSubscriber()
+	s := newSharedStream(nil, "s", streamKey{}, "", cancel)
+	s.subscribers[fast] = true
+	for i := 0; i < 17; i++ {
 		if _, err := s.Write([]byte{byte(i)}); err != nil {
 			t.Fatal(err)
 		}
 		<-fast.chunks
-	}
-	select {
-	case <-slow.dropped:
-	default:
-		t.Fatal("slow subscriber not disconnected")
-	}
-	if ctx.Err() != nil {
-		t.Fatal("slow subscriber canceled healthy stream")
 	}
 	// Upstream first byte is packet-aligned; a join after 17 bytes skips 171 bytes.
 	late := newSubscriber()
