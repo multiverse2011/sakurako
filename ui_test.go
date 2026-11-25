@@ -301,6 +301,7 @@ func TestUIRendersAndPollsPerVisibleTab(t *testing.T) {
 		`||!tabPollsTuners()`,
 		`if(state&&tabPollsTuners()){renderTuners();renderBackends();}`,
 		`&&tabPollsTuners())tunerTimer=setTimeout(pollTuners,5000)`,
+		`setTimeout(()=>controller.abort(),25000)`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("/ui/app.js does not contain %s", want)
@@ -308,6 +309,32 @@ func TestUIRendersAndPollsPerVisibleTab(t *testing.T) {
 	}
 	if strings.Contains(script, `renderOverview();renderServices()`) {
 		t.Error("/ui/app.js redraws both tabs on every state poll")
+	}
+}
+
+// Rebuilding the Services table on every state poll clears the user's text selection. The
+// renderer skips the rebuild when the values it reads are unchanged; with no JS runner here,
+// pin the key (it must cover every value the render reads), the early return before
+// replaceChildren, and saving the key only after the whole draw so a failed render retries.
+func TestUIServicesSkipsRebuildWhenInputsUnchanged(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	recorder := httptest.NewRecorder()
+	g.ServeHTTP(recorder, httptest.NewRequest("GET", "/ui/app.js", nil))
+	script := strings.Join(strings.Fields(recorder.Body.String()), "")
+	for _, want := range []string{
+		`constkey=JSON.stringify([query,type,backend,sort,state.services,state.backends.map(b=>[b.id,b.priority]),state.conflicting_service_ids]);`,
+		`if(key===servicesKey)return;`,
+		`servicesKey=key;`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("/ui/app.js does not contain %s", want)
+		}
+	}
+	guard := strings.Index(script, `if(key===servicesKey)return;`)
+	rebuild := strings.Index(script, `body.replaceChildren()`)
+	saved := strings.Index(script, `servicesKey=key;`)
+	if guard < 0 || rebuild < 0 || saved < 0 || guard > rebuild || saved < rebuild {
+		t.Errorf("/ui/app.js must skip before replaceChildren and save the key after it (guard %d, rebuild %d, save %d)", guard, rebuild, saved)
 	}
 }
 

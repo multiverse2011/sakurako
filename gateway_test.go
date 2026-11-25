@@ -606,8 +606,10 @@ func TestConfig(t *testing.T) {
 	if err := os.WriteFile(p, []byte(`{"backends":[{"id":"a","url":"http://localhost/api"}]}`), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// readConfig validates while filling these defaults, so this also covers
+	// max_stale_seconds >= sync_seconds + catalog_timeout_seconds.
 	c, err := loadConfig(p)
-	if err != nil || c.SyncSeconds != 30 {
-		t.Fatalf("default config failed: %v", err)
+	if err != nil || c.SyncSeconds != 30 || c.CatalogTimeoutSeconds != 20 {
+		t.Fatalf("default config failed: %+v, %v", c, err)
 	}
 }

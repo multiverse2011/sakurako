@@ -65,11 +65,13 @@ docker compose up -d
 | `backends[].service_domain` | 接続先ごとに区別 | 同じ放送を提供する接続先を冗長化する場合に、同じ値を指定 |
 | `channel_names` | `virtual` | チャンネル名に接続先の ID を付加。`upstream` で元の名前を使用 |
 | `sync_seconds` | `30` | 番組情報などの同期間隔（秒） |
-| `catalog_timeout_seconds` | `10` | 接続先ごとの情報取得の制限時間（秒） |
+| `catalog_timeout_seconds` | `20` | 接続先ごとの情報取得の制限時間（秒） |
 | `max_stale_seconds` | `3600` | 最後に取得できた情報の有効期間（秒） |
 | `stream_timeout_seconds` | `30` | 配信の接続・読み書きの制限時間（秒） |
 
 `max_stale_seconds` は `sync_seconds + catalog_timeout_seconds` 以上にします。[設定例](sakurako.example.json)も参照してください。
+
+`catalog_timeout_seconds` の既定値は 20 秒です（v0.3.0 までは 10 秒）。v0.3.0 以前から更新する場合、`catalog_timeout_seconds` を省略したままだと `max_stale_seconds` が `sync_seconds + 20` 未満の設定（例: `sync_seconds` 30・`max_stale_seconds` 40）は起動に失敗します。`max_stale_seconds` を上げるか、`"catalog_timeout_seconds": 10` を明示してください。
 
 `channel_names` に `upstream` を指定すると、接続先が違っても同じ名前のチャンネルは 1 つにまとまります。同じ `service_domain` を設定した接続先どうしで、同じ名前のチャンネルが別の放送（`networkId` が異なる）を指している場合、そのチャンネルは優先度が最も高い接続先と同じ `networkId` のソースだけを残します（同じ放送の予備はそのまま使えます）。別の放送へは切り替えず、優先度が最も高い接続先の情報が古くなった場合も、同じ `networkId` の予備が使えなければそのチャンネルの配信を止めます。同じ `service_domain` に同じ放送の予備が無ければ、別の `service_domain` にある同名チャンネルにも切り替えません。この競合は `/healthz` の `conflicting_channels` とログに表示され、`conflicting_service_ids` と同じく `/healthz` は 503（`ready: false`）になります。
 
@@ -82,7 +84,7 @@ docker compose up -d
 
 - **情報の集約**：各 Mirakurun のサービス・番組情報を定期的に取得します。チャンネル名は `tokyo-3237` のように接続先ごとに区別します。
 - **配信元の選択**：接続先の状態と `priority` に応じて選びます。チューナーの割り当てやデコードは Mirakurun が行います。配信途中で失敗した接続先は 10 秒間クールダウンしますが、他に使える候補が無い場合はそのクールダウン中でも試します。チューナー不足などサービス・チャンネル単位のクールダウンは、この場合も守ります。カタログを取得できていない（情報が古い・取得に失敗した）接続先は対象に含みません。
-- **配信の共有**：同じ放送への要求は、条件が合えば Mirakurun への 1 接続にまとめます。
+- **配信の共有**：同じ放送への要求は、条件が合えば Mirakurun への 1 接続にまとめます。購読者が未読のまま 16 MiB を超えて遅れた場合、その購読者だけを切断します。
 - **状態の確認**：管理画面で接続状況・転送レート・設定・ログを確認できます。同期状態や ID の競合は `/healthz` でも確認できます。
 
 ## 制限事項
