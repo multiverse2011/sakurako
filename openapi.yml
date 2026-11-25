@@ -520,7 +520,7 @@
         - "Catalog"
   "/api/channels/{type}/{channel}/stream":
     "get":
-      "description": "Whole-transponder MPEG-TS from the preferred backend for this channel. Channel names follow channel_names (virtual by default, upstream for Mirakurun-compatible clients). With upstream names, configured priority (not health or freshness) picks the broadcast for a shared name, and only sources with the same service domain fail over. Sources that disagree on networkId are different broadcasts: the winner is chosen including stale catalogs, and only fresh sources with the winner's networkId are served, so an unavailable winner never switches to another broadcast. Sharing otherwise matches service streams; priority does not split groups and decode=0 may join a decoded stream."
+      "description": "Whole-transponder MPEG-TS from the preferred backend for this channel. Channel names follow channel_names (virtual by default, upstream for Mirakurun-compatible clients). With upstream names, configured priority (not health or freshness) picks the broadcast for a shared name, and only sources with the same service domain fail over. Sources that disagree on networkId are different broadcasts: the winner is chosen including stale catalogs, and only fresh sources with the winner's networkId are served, so an unavailable winner never switches to another broadcast. When choosing a source to start the stream, sources that are healthy and outside their stream cooldown are used; if there is no such source, sources that are healthy but cooling down as a whole backend are tried. A service or channel cooldown from a tuner shortage is still respected. Sharing otherwise matches service streams; priority does not split groups and decode=0 may join a decoded stream."
       "parameters":
         -
           "description": "Broadcast type: GR, BS, CS or SKY"
@@ -600,7 +600,7 @@
       "tags":
         - "Streaming"
     "head":
-      "description": "Checks that the channel exists and at least one source is usable without allocating a tuner."
+      "description": "Checks that the channel exists and that at least one source is eligible without allocating a tuner. Eligible means a healthy source outside its stream cooldown; when none exists, healthy sources whose whole backend is cooling down are also eligible. A service or channel cooldown from a tuner shortage is still respected. 200 does not guarantee tuner allocation or that a stream will start."
       "parameters":
         -
           "in": "path"
@@ -1145,7 +1145,7 @@
         - "Catalog"
   "/api/services/{id}/stream":
     "get":
-      "description": "Continuous MPEG-TS. Matching service/domain/broadcast type requests share one upstream regardless of tuner priority; the connection keeps the allocation of the request that started it. A decode=0 request may join an existing decode=1 stream, never the reverse. Omitted decode is distinct from an explicit value; an omitted priority is not sent upstream. Source failover is attempted only before sending the first body byte. Slow subscribers may be disconnected independently."
+      "description": "Continuous MPEG-TS. Matching service/domain/broadcast type requests share one upstream regardless of tuner priority; the connection keeps the allocation of the request that started it. A decode=0 request may join an existing decode=1 stream, never the reverse. Omitted decode is distinct from an explicit value; an omitted priority is not sent upstream. When choosing a source to start the stream, sources that are healthy and outside their stream cooldown are used; if there is no such source, sources that are healthy but cooling down as a whole backend are tried. A service cooldown from a tuner shortage is still respected. Source failover is attempted only before sending the first body byte. Slow subscribers may be disconnected independently."
       "parameters":
         -
           "description": "Mirakurun numeric identifier"
@@ -1225,7 +1225,7 @@
       "tags":
         - "Streaming"
     "head":
-      "description": "Checks catalog membership and source eligibility without allocating a tuner. Does not verify actual tuner availability or start a stream."
+      "description": "Checks catalog membership and source eligibility without allocating a tuner. Eligible means a healthy source outside its stream cooldown; when none exists, healthy sources whose whole backend is cooling down are also eligible. A service cooldown from a tuner shortage is still respected. 200 does not guarantee tuner allocation or that a stream will start."
       "parameters":
         -
           "description": "Mirakurun numeric identifier"

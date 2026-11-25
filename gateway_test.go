@@ -59,6 +59,7 @@ type fakeBackend struct {
 	started            chan http.Header
 	canceled           chan struct{}
 	stall              bool
+	hold               chan struct{} // returns after headers once closed (or on timeout)
 	end                bool
 	oneChunk           bool
 	continuous         bool
@@ -88,7 +89,7 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 		f.mu.Lock()
 		down, status, stall, end := f.down, f.streamStatus, f.stall, f.end
 		oneChunk, reset := f.oneChunk, f.resetAfterChunk
-		continuous := f.continuous
+		continuous, hold := f.continuous, f.hold
 		failServices, failPrograms, failTuners := f.failServices, f.failPrograms, f.failTuners
 		stallTuners := f.stallTuners
 		failEvents := f.failEvents
@@ -212,6 +213,14 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 			w.Header().Set("X-Mirakurun-Tuner-User-ID", "fake-user")
 			w.WriteHeader(200)
 			w.(http.Flusher).Flush()
+			if hold != nil {
+				// The test decides when this attempt fails without sending data.
+				select {
+				case <-hold:
+				case <-r.Context().Done():
+				}
+				return
+			}
 			payload := []byte("transport-stream")
 			if oneChunk {
 				payload = chunk188
@@ -250,7 +259,13 @@ func gateway(t *testing.T, fs ...*fakeBackend) (*Gateway, *httptest.Server) {
 }
 func gatewayWithCatalogTimeout(t *testing.T, catalogSeconds int, fs ...*fakeBackend) (*Gateway, *httptest.Server) {
 	t.Helper()
-	c := Config{Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: catalogSeconds, MaxStaleSeconds: 60, StreamTimeoutSeconds: 1}
+	return gatewayWithTimeouts(t, catalogSeconds, 1, fs...)
+}
+
+// gatewayWithTimeouts builds a gateway with the given catalog and stream timeouts.
+func gatewayWithTimeouts(t *testing.T, catalogSeconds, streamSeconds int, fs ...*fakeBackend) (*Gateway, *httptest.Server) {
+	t.Helper()
+	c := Config{Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: catalogSeconds, MaxStaleSeconds: 60, StreamTimeoutSeconds: streamSeconds}
 	for i, f := range fs {
 		c.Backends = append(c.Backends, BackendConfig{ID: fmt.Sprintf("region%d", i), URL: f.server.URL + "/api", Priority: 100 - i, ServiceDomain: "confirmed-broadcasts"})
 	}
@@ -591,8 +606,10 @@ func TestConfig(t *testing.T) {
 	if err := os.WriteFile(p, []byte(`{"backends":[{"id":"a","url":"http://localhost/api"}]}`), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// readConfig validates while filling these defaults, so this also covers
+	// max_stale_seconds >= sync_seconds + catalog_timeout_seconds.
 	c, err := loadConfig(p)
-	if err != nil || c.SyncSeconds != 30 {
-		t.Fatalf("default config failed: %v", err)
+	if err != nil || c.SyncSeconds != 30 || c.CatalogTimeoutSeconds != 20 {
+		t.Fatalf("default config failed: %+v, %v", c, err)
 	}
 }
