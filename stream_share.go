@@ -60,13 +60,14 @@ type sharedStream struct {
 	droppedSlow bool
 }
 
-// endText names why the upstream was canceled: a slow subscriber was dropped,
-// or every subscriber left on its own.
+// endText names why the upstream was canceled when every subscriber left: the
+// time it was delivering and the bytes read from upstream. A slow drop returns
+// "", because Write already logged that drop with the backend and subscriber.
 func (s *sharedStream) endText() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.droppedSlow {
-		return "dropped (slow subscriber)"
+		return ""
 	}
 	return fmt.Sprintf("ended after %s, %s", formatLogDuration(time.Since(s.started)), formatLogBytes(s.offset))
 }
@@ -80,7 +81,8 @@ func formatLogDuration(d time.Duration) string {
 	return fmt.Sprintf("%dm%02ds", m, s)
 }
 
-// formatLogBytes uses the same binary units and one decimal as the UI.
+// formatLogBytes prints whole bytes below 1 KiB, then the largest binary unit
+// that fits with one decimal, like the UI's byte counts.
 func formatLogBytes(n int64) string {
 	units := []string{"KiB", "MiB", "GiB", "TiB"}
 	if n < 1024 {
@@ -371,9 +373,10 @@ func (s *sharedStream) Write(p []byte) (int, error) {
 	if empty && len(dropped) > 0 {
 		s.droppedSlow = true
 	}
+	backendID := s.backendID
 	s.mu.Unlock()
 	for _, sub := range dropped {
-		log.Printf("stream %s (%s): dropping slow subscriber %s (%s) after %d bytes", s.id, s.key.label(), sub.id, sub.remote, sub.bytes.Load())
+		log.Printf("stream %s (%s via %s): dropping slow subscriber %s (%s) after %d bytes", s.id, s.key.label(), backendID, sub.id, sub.remote, sub.bytes.Load())
 	}
 	if empty {
 		s.cancel()

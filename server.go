@@ -543,7 +543,7 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 		}
 		controller := http.NewResponseController(w)
 		var cause error
-		clientGone := false
+		clientGone, readFailed := false, false
 		for {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				cause, clientGone = werr, true
@@ -554,12 +554,12 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 				break
 			}
 			if err != nil {
-				cause = err
+				cause, readFailed = err, ctx.Err() == nil
 				break
 			}
 			n, err = resp.Body.Read(buf)
 			if n == 0 {
-				cause = err
+				cause, readFailed = err, ctx.Err() == nil
 				break
 			}
 		}
@@ -568,11 +568,15 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 		if cause == nil {
 			cause = io.ErrNoProgress
 		}
-		if r.Context().Err() != nil {
+		// A read error that was not caused by our own cancel is the upstream's
+		// fault, even if every subscriber left while it was being handled.
+		if r.Context().Err() != nil && !readFailed {
 			clientGone = true // client disconnect surfaces as a canceled upstream read
 		}
 		if clientGone {
-			log.Printf("%s via %s: %s", w.key.label(), cfg.ID, w.endText())
+			if text := w.endText(); text != "" {
+				log.Printf("%s via %s: %s", w.key.label(), cfg.ID, text)
+			}
 		} else {
 			log.Printf("%s via %s aborted: %v", w.key.label(), cfg.ID, cause)
 		}

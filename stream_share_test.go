@@ -32,6 +32,8 @@ func (c *logCapture) String() string {
 	return c.buf.String()
 }
 
+// captureLog swaps the standard logger's output until the test ends, so it must
+// not be used by tests that run in parallel with anything that logs.
 func captureLog(t *testing.T) *logCapture {
 	t.Helper()
 	c := &logCapture{}
@@ -649,33 +651,56 @@ func TestDecodeUnsetIsSeparateGroup(t *testing.T) {
 	}
 }
 
+// holdWriter blocks the subscriber's first write so its queue overflows without
+// depending on socket buffers draining at some speed.
+type holdWriter struct {
+	header  http.Header
+	release chan struct{}
+}
+
+func (w *holdWriter) Header() http.Header              { return w.header }
+func (w *holdWriter) WriteHeader(int)                  {}
+func (w *holdWriter) Flush()                           {}
+func (w *holdWriter) SetWriteDeadline(time.Time) error { return nil }
+func (w *holdWriter) Write(p []byte) (int, error) {
+	<-w.release
+	return len(p), nil
+}
+
 func TestStreamEndLogsNormalClose(t *testing.T) {
-	logs := captureLog(t)
 	a := newFake(t, 10, "A")
-	a.mu.Lock()
-	a.continuous = true
-	a.mu.Unlock()
-	_, s := gateway(t, a)
+	g, s := gateway(t, a)
+	channel := g.channelName(g.config.Backends[0], "27")
+	for _, tc := range []struct{ name, path, label string }{
+		{"service", streamURL(s.URL, 1000101), "service 1000101"},
+		{"channel", s.URL + "/api/channels/GR/" + channel + "/stream", "channel GR/" + channel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			resp, err := testClient.Get(tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The fake sends exactly this one body, which fixes the byte count.
+			if body := readStreamBody(t, resp); body != "transport-stream" {
+				t.Fatalf("bad body %q", body)
+			}
+			resp.Body.Close()
+			waitCancel(t, a)
 
-	resp, err := testClient.Get(streamURL(s.URL, 1000101))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.ReadFull(resp.Body, make([]byte, 188)); err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	waitCancel(t, a)
-
-	got := waitLog(t, logs, "via region0: ended after")
-	requireNotLogged(t, got, "client disconnected", "context canceled")
-	if !strings.Contains(got, ", 188 B") {
-		t.Fatalf("summary lacks the transferred size:\n%s", got)
+			got := waitLog(t, logs, tc.label+" via region0: ended after")
+			if !strings.Contains(got, ", 16 B") {
+				t.Fatalf("summary lacks the transferred size:\n%s", got)
+			}
+			if n := strings.Count(got, tc.label+" via region0: ended after"); n != 1 {
+				t.Fatalf("end summary logged %d times:\n%s", n, got)
+			}
+			requireNotLogged(t, got, "client disconnected", "context canceled", "aborted", "dropped")
+		})
 	}
 }
 
 func TestStreamEndLogsSlowDrop(t *testing.T) {
-	logs := captureLog(t)
 	svc, prog := fixture(10, 101, "slow")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -694,9 +719,6 @@ func TestStreamEndLogsSlowDrop(t *testing.T) {
 				return
 			}
 			w.(http.Flusher).Flush()
-			if r.Context().Err() != nil {
-				return
-			}
 		}
 	}))
 	defer upstream.Close()
@@ -705,44 +727,139 @@ func TestStreamEndLogsSlowDrop(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.Sync(context.Background())
-	server := httptest.NewServer(g)
-	defer server.Close()
+	channel := g.channelName(g.config.Backends[0], "27")
+	for _, tc := range []struct{ name, path, label string }{
+		{"service", "/api/services/1000101/stream", "service 1000101"},
+		{"channel", "/api/channels/GR/" + channel + "/stream", "channel GR/" + channel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			rw := &holdWriter{header: http.Header{}, release: make(chan struct{})}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() {
+					// The handler aborts the response once the stream ends.
+					if v := recover(); v != nil && v != http.ErrAbortHandler {
+						t.Errorf("stream handler panicked: %v", v)
+					}
+				}()
+				g.ServeHTTP(rw, httptest.NewRequest("GET", tc.path, nil).WithContext(ctx))
+			}()
 
-	// The subscriber never reads, so its queue overflows while upstream keeps going.
-	resp, err := testClient.Get(server.URL + "/api/services/1000101/stream")
-	if err != nil {
-		t.Fatal(err)
+			got := waitLog(t, logs, "("+tc.label+" via a): dropping slow subscriber")
+			// The blocked handler cannot clean up, so an empty stream map means
+			// upstreamStream made its end-of-stream decision without a second line.
+			waitStreamsDrained(t, g)
+			close(rw.release)
+			<-done
+			got = logs.String()
+			if n := strings.Count(got, "("+tc.label+" via a): dropping slow subscriber"); n != 1 {
+				t.Fatalf("slow drop logged %d times:\n%s", n, got)
+			}
+			requireNotLogged(t, got, "client disconnected", "ended after", "aborted", "closed pipe", tc.label+" via a:")
+		})
 	}
-	defer resp.Body.Close()
-
-	waitLog(t, logs, "dropping slow subscriber")
-	got := waitLog(t, logs, "via a: dropped (slow subscriber)")
-	requireNotLogged(t, got, "client disconnected", "ended after", "closed pipe")
 }
 
 func TestStreamEndLogsUpstreamFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*fakeBackend)
+	}{
+		{"eof", func(f *fakeBackend) { f.end = true }},
+		{"mid-stream reset", func(f *fakeBackend) { f.resetAfterChunk = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			a := newFake(t, 10, "A")
+			a.mu.Lock()
+			tc.setup(a)
+			a.mu.Unlock()
+			_, s := gateway(t, a)
+
+			resp, err := testClient.Get(streamURL(s.URL, 1000101))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			got := waitLog(t, logs, "service 1000101 via region0 aborted: ")
+			if n := strings.Count(got, "service 1000101 via region0 aborted: "); n != 1 {
+				t.Fatalf("upstream failure logged %d times:\n%s", n, got)
+			}
+			requireNotLogged(t, got, "client disconnected", "ended after", "dropped")
+		})
+	}
+}
+
+func TestStreamEndLogsBeforeStart(t *testing.T) {
 	logs := captureLog(t)
 	a := newFake(t, 10, "A")
 	a.mu.Lock()
-	a.end = true
+	a.stall = true
 	a.mu.Unlock()
-	_, s := gateway(t, a)
+	g, s := gateway(t, a)
 
-	resp, err := testClient.Get(streamURL(s.URL, 1000101))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	got := waitLog(t, logs, "via region0 aborted: EOF")
-	requireNotLogged(t, got, "client disconnected", "ended after", "dropped (slow subscriber)")
+	// The response headers wait for the first byte, so the client must leave
+	// while the request is still in flight.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req, _ := http.NewRequestWithContext(ctx, "GET", streamURL(s.URL, 1000101), nil)
+		if resp, err := testClient.Do(req); resp != nil {
+			resp.Body.Close()
+		} else if err != nil && ctx.Err() == nil {
+			t.Errorf("request failed before the client left: %v", err)
+		}
+	}()
+	waitStarted(t, a)
+	cancel()
+	<-done
+	waitCancel(t, a)
+	waitStreamsDrained(t, g)
+	// Nothing is logged in this case; let the stream goroutine settle first.
+	time.Sleep(50 * time.Millisecond)
+	requireNotLogged(t, logs.String(), "client disconnected", "ended after", "aborted", "dropped")
 }
 
-func TestStreamEndTextFormat(t *testing.T) {
-	s := newSharedStream(nil, "s", streamKey{}, "", func() {})
-	s.started = time.Now().Add(-(time.Hour + 2*time.Minute + 3*time.Second + 400*time.Millisecond))
-	s.offset = 3328599654 // 3.1 GiB
-	if got, want := s.endText(), "ended after 1h02m03s, 3.1 GiB"; got != want {
-		t.Fatalf("end text %q, want %q", got, want)
+func TestFormatLogDuration(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "0m00s"},
+		{400 * time.Millisecond, "0m00s"},
+		{59*time.Second + 400*time.Millisecond, "0m59s"},
+		{59*time.Second + 600*time.Millisecond, "1m00s"},
+		{2*time.Minute + 3*time.Second, "2m03s"},
+		{time.Hour + 2*time.Minute + 3*time.Second + 400*time.Millisecond, "1h02m03s"},
+	} {
+		if got := formatLogDuration(tc.d); got != tc.want {
+			t.Errorf("formatLogDuration(%v) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
+func TestFormatLogBytes(t *testing.T) {
+	for _, tc := range []struct {
+		n    int64
+		want string
+	}{
+		{0, "0 B"},
+		{1023, "1023 B"},
+		{1024, "1.0 KiB"},
+		{1536, "1.5 KiB"},
+		{1 << 20, "1.0 MiB"},
+		{3328599654, "3.1 GiB"},
+		{2 << 40, "2.0 TiB"},
+	} {
+		if got := formatLogBytes(tc.n); got != tc.want {
+			t.Errorf("formatLogBytes(%d) = %q, want %q", tc.n, got, tc.want)
+		}
 	}
 }
