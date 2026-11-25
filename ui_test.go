@@ -311,6 +311,30 @@ func TestUIRendersAndPollsPerVisibleTab(t *testing.T) {
 	}
 }
 
+// Rebuilding the Services table on every state poll clears the user's text selection. The
+// renderer skips the rebuild when the values it reads are unchanged; with no JS runner here,
+// pin the key (it must cover every value the render reads) and the early return before
+// replaceChildren, like the other wiring tests above.
+func TestUIServicesSkipsRebuildWhenInputsUnchanged(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	recorder := httptest.NewRecorder()
+	g.ServeHTTP(recorder, httptest.NewRequest("GET", "/ui/app.js", nil))
+	script := strings.Join(strings.Fields(recorder.Body.String()), "")
+	for _, want := range []string{
+		`constkey=JSON.stringify([query,type,backend,sort,state.services,state.backends.map(b=>[b.id,b.priority]),state.conflicting_service_ids]);`,
+		`if(body.dataset.renderKey===key)return;body.dataset.renderKey=key;`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("/ui/app.js does not contain %s", want)
+		}
+	}
+	guard := strings.Index(script, `body.dataset.renderKey===key`)
+	rebuild := strings.Index(script, `body.replaceChildren()`)
+	if guard < 0 || rebuild < 0 || guard > rebuild {
+		t.Errorf("/ui/app.js must skip the rebuild before replaceChildren (guard %d, rebuild %d)", guard, rebuild)
+	}
+}
+
 func TestUISharedServiceListsEveryCandidate(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"), newFake(t, 10, "service"))
 	snapshot := g.uiState(time.Now())

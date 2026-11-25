@@ -30,9 +30,13 @@ function renderServices(){
  fillSelect($('service-type'),state.services.reduce((m,s)=>(s.type&&m.set(s.type,(m.get(s.type)||0)+1),m),new Map()),state.services.length,'All types');
  fillSelect($('service-backend'),new Map(state.backends.map(b=>[b.id,state.services.filter(s=>s.candidates.some(c=>c.id===b.id)).length])),state.services.length,'All backends');
  const query=$('search').value.toLowerCase(),type=$('service-type').value,backend=$('service-backend').value,sort=$('service-sort').value;
+ const body=$('service-list');
+ // Rebuilding the rows clears a text selection, so redraw only when a value read below changed.
+ const key=JSON.stringify([query,type,backend,sort,state.services,state.backends.map(b=>[b.id,b.priority]),state.conflicting_service_ids]);
+ if(body.dataset.renderKey===key)return;body.dataset.renderKey=key;
  const matches=s=>`${s.name} ${s.id}`.toLowerCase().includes(query)&&(!type||s.type===type)&&(!backend||s.candidates.some(c=>c.id===backend));
  const services=state.services.filter(matches);services.sort(sort==='name'?(a,b)=>String(a.name).localeCompare(String(b.name))||a.id-b.id:(a,b)=>a.id-b.id);
- const body=$('service-list');body.replaceChildren();
+ body.replaceChildren();
  for(const s of services){const tr=el('tr');const title=el('td',s.name);title.append(el('div',`#${s.id}${s.type ? ` · ${s.type}` : ""}`,'subtitle'));tr.append(title,el('td',s.candidates.map(c=>c.id+' [source priority '+(state.backends.find(b=>b.id===c.id)?.priority ?? '—')+']'+(c.available?'':' (unavailable)')).join(' / ')),el('td',s.preferred||'No candidate'));body.append(tr);}
  const summary=`Showing ${services.length} of ${state.services.length} services`;if($('service-count').textContent!==summary)$('service-count').textContent=summary;
  if(!services.length){const tr=el('tr'),td=el('td',state.services.length?'No services match these filters.':'No services in the catalog.');td.colSpan=3;tr.append(td);body.append(tr);}
