@@ -553,7 +553,7 @@ func TestUIServicesFilterMarkup(t *testing.T) {
 	}
 }
 
-// The UI has no JS test runner; this pins the refresh wiring and the paused label behind the screenshots.
+// The UI has no JS test runner; this pins the refresh wiring, the paused label and the header version/update wiring behind the screenshots.
 func TestUIManualRefreshControls(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"))
 	for _, tc := range []struct{ path, want string }{
