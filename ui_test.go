@@ -187,9 +187,294 @@ func TestUITunerCountsSkipsDisconnectedClient(t *testing.T) {
 
 func TestCountTunersIsUsing(t *testing.T) {
 	// Mirakurun may report allocation only through isUsing.
-	inUse, total, free, fault := countTuners([]object{{"isUsing": true}, {"isAvailable": true}, {"isFault": true}})
-	if inUse != 1 || total != 3 || free != 1 || fault != 1 {
-		t.Fatalf("countTuners: %d %d %d %d", inUse, total, free, fault)
+	c := countTuners([]object{{"isUsing": true}, {"isAvailable": true}, {"isFault": true}})
+	if c.inUse != 1 || c.total != 3 || c.free != 1 || c.fault != 1 {
+		t.Fatalf("countTuners: %+v", c)
+	}
+	// Without users there is no way to tell who holds it, so it is not Sakurako's.
+	if c.byHolder["other"] != 1 {
+		t.Fatalf("isUsing without users: %+v", c.byHolder)
+	}
+}
+
+func TestCountTunersUsageBreakdown(t *testing.T) {
+	list := []object{
+		{"types": []any{"GR"}, "users": []any{map[string]any{"id": "10.0.0.2:5000", "agent": "Sakurako"}}},
+		{"types": []any{"GR"}, "users": []any{map[string]any{"id": "Mirakurun:getEPG()", "priority": -1}}},
+		{"types": []any{"BS"}, "users": []any{map[string]any{"id": "Mirakurun:getServices()"}}},
+		{"types": []any{"BS", "CS", "SKY"}, "users": []any{map[string]any{"id": "10.0.0.9:6000", "agent": "tvheadend"}}},
+		// A tuner shared by the backend and Sakurako is counted once, as Sakurako's.
+		{"types": []any{"GR"}, "users": []any{map[string]any{"id": "Mirakurun:getEPG()"}, map[string]any{"id": "10.0.0.3:7000", "agent": "Sakurako"}}},
+		{"types": []any{"GR", "BS"}, "isAvailable": true},
+		{"types": []any{"CS"}, "isAvailable": true},
+	}
+	c := countTuners(list)
+	if c.inUse != 5 || c.total != 7 || c.free != 2 || c.fault != 0 {
+		t.Fatalf("counts: %+v", c)
+	}
+	for kind, want := range map[string]int{"sakurako": 2, "epg": 1, "backend": 1, "other": 1} {
+		if c.byHolder[kind] != want {
+			t.Errorf("by %s: got %d, want %d", kind, c.byHolder[kind], want)
+		}
+	}
+	// A free combined tuner is free for each of its types; a type with no free
+	// tuner still shows up as zero instead of disappearing.
+	for typ, want := range map[string]int{"GR": 1, "BS": 1, "CS": 1, "SKY": 0} {
+		if got := c.freeByType[typ]; got != want {
+			t.Errorf("%s free: got %d, want %d", typ, got, want)
+		}
+	}
+}
+
+func TestCountTunersSkipsUnallocatable(t *testing.T) {
+	list := []object{
+		{"types": []any{"GR"}, "isAvailable": false},
+		{"types": []any{"GR"}, "isFree": false},
+		{"types": []any{"GR"}, "isAvailable": true, "isFree": true},
+		{"types": []any{"GR"}},                            // an upstream omitting both fields keeps the old rule
+		{"types": []any{"GR", "GR"}, "isAvailable": true}, // a repeated type counts once
+	}
+	c := countTuners(list)
+	if c.total != 5 || c.inUse != 0 || c.free != 3 || c.fault != 0 {
+		t.Fatalf("counts: %+v", c)
+	}
+	if got := c.freeByType["GR"]; got != 3 {
+		t.Fatalf("GR free: %d, want 3", got)
+	}
+}
+
+type tunerTypeFree struct {
+	Type string `json:"type"`
+	Free int    `json:"free"`
+}
+
+type tunerWire struct {
+	Available  bool            `json:"available"`
+	InUse      int             `json:"in_use"`
+	Total      int             `json:"total"`
+	Free       int             `json:"free"`
+	Fault      int             `json:"fault"`
+	InUseBy    map[string]int  `json:"in_use_by"`
+	FreeByType []tunerTypeFree `json:"free_by_type"`
+	Backends   []struct {
+		ID         string          `json:"id"`
+		InUse      int             `json:"in_use"`
+		Total      int             `json:"total"`
+		Free       int             `json:"free"`
+		Fault      int             `json:"fault"`
+		InUseBy    map[string]int  `json:"in_use_by"`
+		FreeByType []tunerTypeFree `json:"free_by_type"`
+	} `json:"backends"`
+}
+
+func freeTypes(t *testing.T, list []tunerTypeFree) map[string]int {
+	t.Helper()
+	m := map[string]int{}
+	for _, row := range list {
+		if _, dup := m[row.Type]; dup {
+			t.Fatalf("duplicate type %q in free_by_type", row.Type)
+		}
+		m[row.Type] = row.Free
+	}
+	return m
+}
+
+func checkUsageSum(t *testing.T, name string, inUse int, by map[string]int) {
+	t.Helper()
+	sum := 0
+	for _, n := range by {
+		sum += n
+	}
+	if sum != inUse {
+		t.Errorf("%s: in_use_by sums to %d, but in_use is %d (%v)", name, sum, inUse, by)
+	}
+}
+
+func TestUITunerCountsUsageBreakdown(t *testing.T) {
+	a := newFake(t, 10, "primary")
+	a.tuners = []object{
+		{"types": []any{"GR"}, "users": []object{{"id": "Mirakurun:getEPG()", "priority": -1}}},
+		{"types": []any{"GR", "BS"}, "isAvailable": true},
+	}
+	_, s := gateway(t, a)
+	var got tunerWire
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if got.InUse != 1 || got.Total != 2 || got.Free != 1 {
+		t.Fatalf("totals: %+v", got)
+	}
+	if n, ok := got.InUseBy["epg"]; !ok || n != 1 {
+		t.Fatalf("aggregate epg: %v", got.InUseBy)
+	}
+	if n, ok := got.InUseBy["sakurako"]; !ok || n != 0 {
+		t.Fatalf("aggregate sakurako: %v", got.InUseBy)
+	}
+	if len(got.Backends) != 1 {
+		t.Fatalf("rows: %+v", got.Backends)
+	}
+	if got.Backends[0].ID != "region0" {
+		t.Fatalf("backend id: %+v", got.Backends)
+	}
+	if n, ok := got.Backends[0].InUseBy["epg"]; !ok || n != 1 {
+		t.Fatalf("backend epg: %+v", got.Backends[0].InUseBy)
+	}
+	for _, row := range []struct {
+		name  string
+		types []tunerTypeFree
+	}{{"aggregate", got.FreeByType}, {"backend", got.Backends[0].FreeByType}} {
+		// GR before BS: the display order is fixed.
+		if len(row.types) != 2 || row.types[0].Type != "GR" || row.types[1].Type != "BS" {
+			t.Fatalf("%s free by type: %+v", row.name, row.types)
+		}
+		if types := freeTypes(t, row.types); types["GR"] != 1 || types["BS"] != 1 {
+			t.Fatalf("%s free by type: %v", row.name, types)
+		}
+	}
+}
+
+// The issue's A/B layout: 2 / 10 in use, both by the backend's EPG, and the
+// remaining capacity differs per type.
+func TestUITunerCountsIssueScenario(t *testing.T) {
+	a, b := newFake(t, 10, "a"), newFake(t, 11, "b")
+	for i := 0; i < 4; i++ {
+		a.tuners = append(a.tuners, object{"index": i, "types": []any{"GR", "BS"}, "isAvailable": true})
+	}
+	for i := 0; i < 4; i++ {
+		b.tuners = append(b.tuners, object{"index": i, "types": []any{"BS", "CS"}, "isAvailable": true})
+	}
+	for i := 0; i < 2; i++ {
+		b.tuners = append(b.tuners, object{"index": 4 + i, "types": []any{"GR"}, "users": []object{{"id": "Mirakurun:getEPG()", "priority": -1}}})
+	}
+	_, s := gateway(t, a, b)
+	var got tunerWire
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if !got.Available || got.InUse != 2 || got.Total != 10 || got.Free != 8 || got.Fault != 0 {
+		t.Fatalf("totals: %+v", got)
+	}
+	if n, ok := got.InUseBy["epg"]; !ok || n != 2 {
+		t.Fatalf("aggregate epg: %v", got.InUseBy)
+	}
+	if n, ok := got.InUseBy["sakurako"]; !ok || n != 0 {
+		t.Fatalf("aggregate sakurako: %v", got.InUseBy)
+	}
+	if types := freeTypes(t, got.FreeByType); len(types) != 3 || types["GR"] != 4 || types["BS"] != 8 || types["CS"] != 4 {
+		t.Fatalf("aggregate free by type: %v", types)
+	}
+	if len(got.Backends) != 2 {
+		t.Fatalf("rows: %+v", got.Backends)
+	}
+	for i, want := range []struct {
+		id                 string
+		inUse, total, free int
+		epg                int
+		types              map[string]int
+	}{
+		{"region0", 0, 4, 4, 0, map[string]int{"GR": 4, "BS": 4}},
+		{"region1", 2, 6, 4, 2, map[string]int{"GR": 0, "BS": 4, "CS": 4}},
+	} {
+		row := got.Backends[i]
+		if row.ID != want.id || row.InUse != want.inUse || row.Total != want.total || row.Free != want.free {
+			t.Fatalf("row %d: %+v", i, row)
+		}
+		if n, ok := row.InUseBy["epg"]; !ok || n != want.epg {
+			t.Fatalf("row %s epg: %v", want.id, row.InUseBy)
+		}
+		types := freeTypes(t, row.FreeByType)
+		for typ, n := range want.types {
+			if count, ok := types[typ]; !ok || count != n {
+				t.Fatalf("row %s %s free: %v", want.id, typ, types)
+			}
+		}
+		if len(types) != len(want.types) {
+			t.Fatalf("row %s free types: %v", want.id, types)
+		}
+	}
+
+	// One failing backend leaves only the other's numbers.
+	b.mu.Lock()
+	b.failTuners = 500
+	b.mu.Unlock()
+	got = tunerWire{}
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if !got.Available || got.InUse != 0 || got.Total != 4 || got.Free != 4 {
+		t.Fatalf("partial failure totals: %+v", got)
+	}
+	if len(got.Backends) != 1 || got.Backends[0].ID != "region0" {
+		t.Fatalf("partial failure rows: %+v", got.Backends)
+	}
+	if types := freeTypes(t, got.FreeByType); len(types) != 2 || types["GR"] != 4 || types["BS"] != 4 {
+		t.Fatalf("partial failure free by type: %v", types)
+	}
+
+	// Every backend failing still answers 200 with empty counts.
+	a.mu.Lock()
+	a.failTuners = 500
+	a.mu.Unlock()
+	got = tunerWire{}
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if got.Available || len(got.Backends) != 0 || got.InUse != 0 || got.Total != 0 || got.Free != 0 || len(got.FreeByType) != 0 {
+		t.Fatalf("all failed: %+v", got)
+	}
+	for _, kind := range []string{"sakurako", "epg", "backend", "other"} {
+		if n, ok := got.InUseBy[kind]; !ok || n != 0 {
+			t.Fatalf("all failed %s: %v", kind, got.InUseBy)
+		}
+	}
+}
+
+// Sakurako and external clients together: every row's breakdown adds up to its
+// in_use, so a shared tuner is never counted twice.
+func TestUITunerCountsUsageSums(t *testing.T) {
+	a, b := newFake(t, 10, "a"), newFake(t, 11, "b")
+	a.tuners = []object{
+		{"types": []any{"GR"}, "users": []object{{"id": "10.0.0.2:5000", "agent": "Sakurako"}}},
+		{"types": []any{"GR"}, "users": []object{{"id": "10.0.0.9:6000", "agent": "kodi"}}},
+		{"types": []any{"GR"}, "users": []object{{"id": "Mirakurun:getEPG()"}}},
+		{"types": []any{"GR", "BS"}, "isAvailable": true},
+	}
+	b.tuners = []object{
+		{"types": []any{"BS"}, "users": []object{{"id": "10.0.0.3:7000", "agent": "Sakurako"}}},
+		{"types": []any{"BS"}, "users": []object{{"id": "10.0.0.8:8000", "agent": "mpv"}}},
+	}
+	_, s := gateway(t, a, b)
+	var got tunerWire
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if got.InUse != 5 || got.Total != 6 || got.Free != 1 {
+		t.Fatalf("totals: %+v", got)
+	}
+	for kind, want := range map[string]int{"sakurako": 2, "epg": 1, "backend": 0, "other": 2} {
+		if n, ok := got.InUseBy[kind]; !ok || n != want {
+			t.Fatalf("aggregate %s: %v", kind, got.InUseBy)
+		}
+	}
+	checkUsageSum(t, "aggregate", got.InUse, got.InUseBy)
+	if len(got.Backends) != 2 {
+		t.Fatalf("rows: %+v", got.Backends)
+	}
+	for _, row := range got.Backends {
+		checkUsageSum(t, row.ID, row.InUse, row.InUseBy)
+	}
+	if n, ok := got.Backends[0].InUseBy["sakurako"]; !ok || n != 1 {
+		t.Fatalf("region0 sakurako: %v", got.Backends[0].InUseBy)
+	}
+	if n, ok := got.Backends[1].InUseBy["other"]; !ok || n != 1 {
+		t.Fatalf("region1 other: %v", got.Backends[1].InUseBy)
+	}
+}
+
+// No JS runner here, so pin the labels and the fields the screen reads.
+func TestUITunerUsageMarkup(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	for path, needles := range map[string][]string{
+		"/ui/":       {"Tuners (in use / total)"},
+		"/ui/app.js": {"in_use_by", "free_by_type", "by Sakurako", "by backend (", ": EPG", "by other / unidentified", "Tuner information unavailable"},
+	} {
+		r := httptest.NewRecorder()
+		g.ServeHTTP(r, httptest.NewRequest("GET", path, nil))
+		for _, needle := range needles {
+			if !strings.Contains(r.Body.String(), needle) {
+				t.Errorf("%s: missing %s", path, needle)
+			}
+		}
 	}
 }
 

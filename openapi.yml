@@ -289,10 +289,38 @@
                 "type": "integer"
               "free":
                 "type": "integer"
+              "free_by_type":
+                "description": "Free tuners per type; a tuner supporting several types is free for each of them, and a type with no free tuner still appears with zero."
+                "items":
+                  "additionalProperties": true
+                  "properties":
+                    "free":
+                      "type": "integer"
+                    "type":
+                      "type": "string"
+                  "type": "object"
+                "type": "array"
               "id":
                 "type": "string"
               "in_use":
                 "type": "integer"
+              "in_use_by":
+                "additionalProperties": true
+                "description": "In-use tuners by holder. A tuner shared by several holders is counted once, in this order: sakurako, epg, backend, other. Sakurako is recognised approximately by the User-Agent it sends upstream, so another client or Sakurako instance sending the same value is counted as sakurako too."
+                "properties":
+                  "backend":
+                    "description": "Other internal use by the backend itself, such as Mirakurun:getServices()."
+                    "type": "integer"
+                  "epg":
+                    "description": "The backend's own EPG update (Mirakurun:getEPG())."
+                    "type": "integer"
+                  "other":
+                    "description": "External clients that do not go through Sakurako, or usage that cannot be identified."
+                    "type": "integer"
+                  "sakurako":
+                    "description": "Tuners held by Sakurako's own streams."
+                    "type": "integer"
+                "type": "object"
               "total":
                 "type": "integer"
             "type": "object"
@@ -301,10 +329,38 @@
           "description": "Tuners reporting isFault; they are counted neither as in use nor as free."
           "type": "integer"
         "free":
-          "description": "Neither in use nor faulty."
+          "description": "Neither in use nor faulty; a tuner reporting isAvailable or isFree as false is not free either."
           "type": "integer"
+        "free_by_type":
+          "description": "Free tuners per type; a tuner supporting several types is free for each of them, and a type with no free tuner still appears with zero."
+          "items":
+            "additionalProperties": true
+            "properties":
+              "free":
+                "type": "integer"
+              "type":
+                "type": "string"
+            "type": "object"
+          "type": "array"
         "in_use":
           "type": "integer"
+        "in_use_by":
+          "additionalProperties": true
+          "description": "In-use tuners by holder. A tuner shared by several holders is counted once, in this order: sakurako, epg, backend, other. Sakurako is recognised approximately by the User-Agent it sends upstream, so another client or Sakurako instance sending the same value is counted as sakurako too."
+          "properties":
+            "backend":
+              "description": "Other internal use by the backend itself, such as Mirakurun:getServices()."
+              "type": "integer"
+            "epg":
+              "description": "The backend's own EPG update (Mirakurun:getEPG())."
+              "type": "integer"
+            "other":
+              "description": "External clients that do not go through Sakurako, or usage that cannot be identified."
+              "type": "integer"
+            "sakurako":
+              "description": "Tuners held by Sakurako's own streams."
+              "type": "integer"
+          "type": "object"
         "total":
           "type": "integer"
       "type": "object"
@@ -384,7 +440,7 @@
         - "Monitoring"
   "/-/ui/tuners":
     "get":
-      "description": "Sakurako-specific live tuner counts (in use / total / free / fault) overall and per backend, for the management UI. A failed backend is omitted, so the UI can show that backend as unknown. Cache-Control: no-store."
+      "description": "Sakurako-specific live tuner counts (in use / total / free / fault, in-use holders and free tuners per type) overall and per backend, for the management UI. A failed backend is omitted, so the UI can show that backend as unknown. Cache-Control: no-store."
       "responses":
         "200":
           "content":
