@@ -453,25 +453,24 @@ func (g *Gateway) channelStream(w http.ResponseWriter, r *http.Request, typ, nam
 
 func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []source, opts streamOptions) {
 	timeout := time.Duration(g.config.StreamTimeoutSeconds) * time.Second
-	// Decide the candidates once per request: the rescue applies only when no
-	// source was usable at the start, not when the last one fails mid-request.
+	// The rescue applies only when no source was usable at the start, not when the
+	// last one fails mid-request.
 	g.mu.RLock()
-	candidates, rescue := g.attemptSources(sources, w.key, time.Now())
+	_, rescue := g.attemptSources(sources, w.key, time.Now())
 	g.mu.RUnlock()
-	for _, s := range candidates {
+	for _, s := range sources {
 		if r.Context().Err() != nil {
 			return
 		}
-		// A normal candidate may have been cooled down by another stream while an
-		// earlier source was being tried. A rescue candidate is cooling as a whole
-		// backend, but its service or channel may still have its own cooldown.
+		// Evaluate each source just before trying it: one that was cooling down or
+		// unhealthy at the start may have recovered while an earlier source was tried.
 		g.mu.RLock()
 		now := time.Now()
-		ok := g.catalogHealthy(s.backend, now)
-		if rescue {
-			ok = ok && !g.keyCooling(s.backend, w.key, now)
-		} else {
-			ok = ok && g.usable(s.backend, w.key, now)
+		ok := g.usable(s.backend, w.key, now)
+		if !ok && rescue {
+			// A rescued source is cooling as a whole backend by design; its service
+			// or channel cooldown is still respected.
+			ok = g.catalogHealthy(s.backend, now) && !g.keyCooling(s.backend, w.key, now)
 		}
 		g.mu.RUnlock()
 		if !ok {

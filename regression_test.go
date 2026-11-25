@@ -451,6 +451,53 @@ func TestCandidateCooledMidRequestIsSkipped(t *testing.T) {
 	waitCancel(t, c)
 }
 
+// A source that was cooling down when the request started is tried once its
+// cooldown expires while an earlier source is still being attempted.
+func TestCoolingSourceRecoveredMidRequestIsTried(t *testing.T) {
+	a, b := newFake(t, 10, "A"), newFake(t, 10, "B")
+	a.hold = make(chan struct{})
+	// The long stream timeout is only a hang guard; A fails when the test releases it.
+	g, s := gatewayWithTimeouts(t, 1, 30, a, b)
+	g.block(1, 1000101, false, "test")
+
+	type result struct {
+		status int
+		body   string
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := testClient.Get(streamURL(s.URL, 1000101))
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, len("transport-stream"))
+		_, err = io.ReadFull(resp.Body, buf)
+		done <- result{status: resp.StatusCode, body: string(buf), err: err}
+	}()
+
+	// A is being tried; B's cooldown expires before A fails.
+	waitStarted(t, a)
+	g.mu.Lock()
+	g.backends[1].blockedUntil = time.Time{}
+	g.mu.Unlock()
+	close(a.hold)
+
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.status != 200 || got.body != "transport-stream" {
+		t.Fatalf("HTTP %d body %q", got.status, got.body)
+	}
+	if b.streamCalls.Load() != 1 {
+		t.Fatalf("recovered source calls = %d, want 1", b.streamCalls.Load())
+	}
+	waitCancel(t, b)
+}
+
 // attemptSources prefers sources outside their cooldowns and falls back to healthy
 // sources that are only cooling as a whole backend when there are no others.
 func TestAttemptSourcesSelection(t *testing.T) {
