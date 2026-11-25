@@ -520,8 +520,9 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 		recordRead := func() {
 			// Record a read failure as soon as the read returns it. A subscriber
 			// leaving later (a canceled read or a failed write) must not relabel a
-			// confirmed upstream failure as a normal end.
-			if err != nil && ctx.Err() == nil {
+			// confirmed upstream failure as a normal end. A clean EOF is not a
+			// failure, so it leaves that line to the subscriber's departure.
+			if err != nil && err != io.EOF && ctx.Err() == nil {
 				readErr = err
 			}
 		}

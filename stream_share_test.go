@@ -636,7 +636,9 @@ func TestDecodeUnsetIsSeparateGroup(t *testing.T) {
 
 // runStream starts one shared stream against g with subs already attached and
 // returns the stream, its log capture and a channel closed after the upstream
-// goroutine has written its ending line.
+// goroutine has written its ending line. It covers upstreamStream's log
+// decision only; HTTP routing, departure notification and the stream map are
+// covered by the existing HTTP tests.
 func runStream(t *testing.T, g *Gateway, key streamKey, sources []source, subs ...*subscriber) (*sharedStream, *logCapture, <-chan struct{}) {
 	t.Helper()
 	logs := captureLog(t)
@@ -654,8 +656,27 @@ func runStream(t *testing.T, g *Gateway, key streamKey, sources []source, subs .
 		defer close(done)
 		s.run(req, sources, streamOptions{})
 	}()
-	t.Cleanup(cancel)
+	// Registered after captureLog, so a failed test cancels and drains the
+	// goroutine before the log capture is restored.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Errorf("stream goroutine did not finish")
+		}
+	})
 	return s, logs, done
+}
+
+// waitClose fails the test if ch does not fire within 5 seconds.
+func waitClose(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
 }
 
 // streamGateway has one healthy backend and no catalog; these tests drive the
@@ -673,18 +694,29 @@ func streamGateway(t *testing.T, url string) *Gateway {
 	return g
 }
 
-// fixedTransport serves body for every stream request.
-type fixedTransport struct{ body func() io.ReadCloser }
-
-func (t fixedTransport) RoundTrip(*http.Request) (*http.Response, error) {
-	return &http.Response{StatusCode: 200, Body: t.body()}, nil
+// fixedTransport serves body(req) for every stream request.
+type fixedTransport struct {
+	body func(*http.Request) io.ReadCloser
 }
 
-// repeatBody returns the same chunk forever, like an upstream that never stops.
-type repeatBody struct{ chunk []byte }
+func (t fixedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 200, Body: t.body(req)}, nil
+}
 
-func (b *repeatBody) Read(p []byte) (int, error) { return copy(p, b.chunk), nil }
-func (b *repeatBody) Close() error               { return nil }
+// repeatBody returns the same chunk until the request is canceled.
+type repeatBody struct {
+	ctx   context.Context
+	chunk []byte
+}
+
+func (b *repeatBody) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return copy(p, b.chunk), nil
+}
+
+func (b *repeatBody) Close() error { return nil }
 
 // dataThenErrBody returns data first and err on the following Read.
 type dataThenErrBody struct {
@@ -740,9 +772,13 @@ func TestStreamEndLogsNormalClose(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			sub := newSubscriber()
 			s, logs, done := runStream(t, g, tc.key, []source{{backend: 0, service: service}}, sub)
-			<-sub.chunks // the only body chunk was read and handed to the subscriber
+			select {
+			case <-sub.chunks: // the only body chunk was read and handed to the subscriber
+			case <-time.After(5 * time.Second):
+				t.Fatal("first chunk was not delivered")
+			}
 			s.unsubscribe(sub)
-			<-done
+			waitClose(t, done, "stream goroutine")
 
 			got := logs.String()
 			want := tc.key.label() + " via a: ended after "
@@ -767,13 +803,13 @@ func TestStreamEndLogsSlowDrop(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := streamGateway(t, "http://127.0.0.1:1")
-			g.streamClient = &http.Client{Transport: fixedTransport{body: func() io.ReadCloser {
-				return &repeatBody{chunk: bytes.Repeat([]byte{0x47}, 32*1024)}
+			g.streamClient = &http.Client{Transport: fixedTransport{body: func(req *http.Request) io.ReadCloser {
+				return &repeatBody{ctx: req.Context(), chunk: bytes.Repeat([]byte{0x47}, 32*1024)}
 			}}}
 			service := object{"channel": object{"type": "GR", "channel": "28"}}
 			// Nothing drains the subscriber, so its queue overflows.
 			_, logs, done := runStream(t, g, tc.key, []source{{backend: 0, service: service}}, newSubscriber())
-			<-done
+			waitClose(t, done, "stream goroutine")
 
 			got := logs.String()
 			want := "(" + tc.key.label() + " via a): dropping slow subscriber"
@@ -787,18 +823,26 @@ func TestStreamEndLogsSlowDrop(t *testing.T) {
 
 func TestStreamEndLogsUpstreamFailure(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		body   func() io.ReadCloser
-		reason string
-		full   bool // the write of the returned data finds the subscriber's queue full
+		name string
+		body func(*http.Request) io.ReadCloser
+		want string // reason after "aborted: "; empty means only a slow drop is logged
+		full bool   // the write of the returned data finds the subscriber's queue full
 	}{
-		{"eof", func() io.ReadCloser { return &dataThenErrBody{data: make([]byte, 188), err: io.EOF} }, "EOF", false},
-		{"mid-stream reset", func() io.ReadCloser {
+		{"eof", func(*http.Request) io.ReadCloser {
+			return &dataThenErrBody{data: make([]byte, 188), err: io.EOF}
+		}, "EOF", false},
+		{"mid-stream reset", func(*http.Request) io.ReadCloser {
 			return &dataThenErrBody{data: make([]byte, 188), err: io.ErrUnexpectedEOF}
 		}, "unexpected EOF", false},
-		{"data and error", func() io.ReadCloser {
+		{"data and error", func(*http.Request) io.ReadCloser {
 			return &dataErrBody{data: make([]byte, 188), err: io.ErrUnexpectedEOF}
 		}, "unexpected EOF", true},
+		{"eof with data", func(*http.Request) io.ReadCloser {
+			return &dataErrBody{data: make([]byte, 188), err: io.EOF}
+		}, "EOF", false},
+		{"eof with last subscriber dropped", func(*http.Request) io.ReadCloser {
+			return &dataErrBody{data: make([]byte, 188), err: io.EOF}
+		}, "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := streamGateway(t, "http://127.0.0.1:1")
@@ -810,10 +854,18 @@ func TestStreamEndLogsUpstreamFailure(t *testing.T) {
 				}
 			}
 			_, logs, done := runStream(t, g, streamKey{id: 3000101}, []source{{backend: 0, service: object{}}}, sub)
-			<-done
+			waitClose(t, done, "stream goroutine")
 
 			got := logs.String()
-			want := "service 3000101 via a aborted: " + tc.reason
+			if tc.want == "" {
+				// A clean EOF is not a failure, so the slow drop is the only line.
+				if n := strings.Count(got, "(service 3000101 via a): dropping slow subscriber"); n != 1 {
+					t.Fatalf("slow drop logged %d times:\n%s", n, got)
+				}
+				requireNotLogged(t, got, "aborted", "ended after", "client disconnected")
+				return
+			}
+			want := "service 3000101 via a aborted: " + tc.want
 			if n := strings.Count(got, want); n != 1 {
 				t.Fatalf("upstream failure logged %d times:\n%s", n, got)
 			}
@@ -834,9 +886,9 @@ func TestStreamEndLogsBeforeStart(t *testing.T) {
 	g := streamGateway(t, upstream.URL)
 	sub := newSubscriber()
 	s, logs, done := runStream(t, g, streamKey{id: 4000101}, []source{{backend: 0, service: object{}}}, sub)
-	<-started
+	waitClose(t, started, "upstream request")
 	s.unsubscribe(sub)
-	<-done
+	waitClose(t, done, "stream goroutine")
 
 	// Leaving before the first byte is not a failure and has nothing to summarize.
 	requireNotLogged(t, logs.String(), "client disconnected", "ended after", "aborted", "dropped", "failed, cooling down")
