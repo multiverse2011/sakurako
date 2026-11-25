@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -69,6 +70,47 @@ type sharedStream struct {
 	ready       chan struct{}
 	status      int
 	offset      int64
+	// droppedSlow records that the last subscriber was dropped for falling
+	// behind, so the closing log names that cause instead of a client error.
+	droppedSlow bool
+}
+
+// endText names why the upstream was canceled when every subscriber left: the
+// time it was delivering and the bytes read from upstream. A slow drop returns
+// "", because Write already logged that drop with the backend and subscriber.
+func (s *sharedStream) endText() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.droppedSlow {
+		return ""
+	}
+	return fmt.Sprintf("ended after %s, %s", formatLogDuration(time.Since(s.started)), formatLogBytes(s.offset))
+}
+
+func formatLogDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h, m, s := int64(d/time.Hour), int64(d/time.Minute%60), int64(d/time.Second%60)
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	}
+	return fmt.Sprintf("%dm%02ds", m, s)
+}
+
+// formatLogBytes prints whole bytes below 1 KiB, then the largest binary unit
+// that fits with one decimal, like the UI's byte counts.
+func formatLogBytes(n int64) string {
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	v, i := float64(n)/1024, 0
+	// Advance when one decimal would round to 1024, so 1048575 bytes prints
+	// "1.0 MiB" rather than "1024.0 KiB".
+	for i < len(units)-1 && math.Round(v*10) >= 10240 {
+		v /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
 func newSubscriber() *subscriber {
@@ -418,9 +460,15 @@ func (s *sharedStream) Write(p []byte) (int, error) {
 		}
 	}
 	empty := len(s.subscribers) == 0
+	// Only this call's drop explains an empty map; an unsubscribe may have
+	// removed the last subscriber just before this Write took the lock.
+	if empty && len(dropped) > 0 {
+		s.droppedSlow = true
+	}
+	backendID := s.backendID
 	s.mu.Unlock()
 	for _, sub := range dropped {
-		log.Printf("stream %s (%s): dropping slow subscriber %s (%s) after %d bytes", s.id, s.key.label(), sub.id, sub.remote, sub.bytes.Load())
+		log.Printf("stream %s (%s via %s): dropping slow subscriber %s (%s) after %d bytes", s.id, s.key.label(), backendID, sub.id, sub.remote, sub.bytes.Load())
 	}
 	if empty {
 		s.cancel()

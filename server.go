@@ -523,8 +523,19 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 		}
 		buf := make([]byte, 32*1024)
 		n := 0
+		var readErr error
+		recordRead := func() {
+			// Record a read failure as soon as the read returns it. A subscriber
+			// leaving later (a canceled read or a failed write) must not relabel a
+			// confirmed upstream failure as a normal end. A clean EOF is not a
+			// failure, so it leaves that line to the subscriber's departure.
+			if err != nil && err != io.EOF && ctx.Err() == nil {
+				readErr = err
+			}
+		}
 		if err == nil {
 			n, err = resp.Body.Read(buf)
+			recordRead()
 		}
 		if n == 0 {
 			if resp != nil {
@@ -565,6 +576,7 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 				break
 			}
 			n, err = resp.Body.Read(buf)
+			recordRead()
 			if n == 0 {
 				cause = err
 				break
@@ -575,11 +587,15 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 		if cause == nil {
 			cause = io.ErrNoProgress
 		}
-		if r.Context().Err() != nil {
+		if readErr != nil {
+			clientGone, cause = false, readErr
+		} else if r.Context().Err() != nil {
 			clientGone = true // client disconnect surfaces as a canceled upstream read
 		}
 		if clientGone {
-			log.Printf("%s via %s: client disconnected: %v", w.key.label(), cfg.ID, cause)
+			if text := w.endText(); text != "" {
+				log.Printf("%s via %s: %s", w.key.label(), cfg.ID, text)
+			}
 		} else {
 			log.Printf("%s via %s aborted: %v", w.key.label(), cfg.ID, cause)
 		}
