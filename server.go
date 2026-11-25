@@ -413,14 +413,11 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, id int64, sourc
 		return
 	}
 	if r.Method == "HEAD" {
-		// HEAD allocates no tuner, but must not claim playability when every source is down.
+		// HEAD allocates no tuner, but must not claim a candidate when every source is down.
 		g.mu.RLock()
-		ok := false
-		for _, s := range sources {
-			ok = ok || g.usable(s.backend, id, time.Now())
-		}
+		candidates, _ := g.attemptSources(sources, streamKey{id: id}, time.Now())
 		g.mu.RUnlock()
-		if !ok {
+		if len(candidates) == 0 {
 			apiError(w, 503, "no healthy source could start the stream")
 			return
 		}
@@ -440,13 +437,10 @@ func (g *Gateway) channelStream(w http.ResponseWriter, r *http.Request, typ, nam
 	}
 	if r.Method == "HEAD" {
 		g.mu.RLock()
-		usable := false
 		key := streamKey{channel: name, channelType: typ}
-		for _, s := range sources {
-			usable = usable || g.usableKey(s.backend, key, time.Now())
-		}
+		candidates, _ := g.attemptSources(sources, key, time.Now())
 		g.mu.RUnlock()
-		if !usable {
+		if len(candidates) == 0 {
 			apiError(w, 503, "no healthy source could start the stream")
 			return
 		}
@@ -459,12 +453,25 @@ func (g *Gateway) channelStream(w http.ResponseWriter, r *http.Request, typ, nam
 
 func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []source, opts streamOptions) {
 	timeout := time.Duration(g.config.StreamTimeoutSeconds) * time.Second
+	// The rescue applies only when no source was usable at the start, not when the
+	// last one fails mid-request.
+	g.mu.RLock()
+	_, rescue := g.attemptSources(sources, w.key, time.Now())
+	g.mu.RUnlock()
 	for _, s := range sources {
 		if r.Context().Err() != nil {
 			return
 		}
+		// Evaluate each source just before trying it: one that was cooling down or
+		// unhealthy at the start may have recovered while an earlier source was tried.
 		g.mu.RLock()
-		ok := g.usableKey(s.backend, w.key, time.Now())
+		now := time.Now()
+		ok := g.usable(s.backend, w.key, now)
+		if !ok && rescue {
+			// A rescued source is cooling as a whole backend by design; its service
+			// or channel cooldown is still respected.
+			ok = g.catalogHealthy(s.backend, now) && !g.keyCooling(s.backend, w.key, now)
+		}
 		g.mu.RUnlock()
 		if !ok {
 			continue
@@ -602,22 +609,59 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 	apiError(w, 503, "no healthy source could start the stream")
 }
 
-// usable reports whether a service stream may be attempted. Called under mu.
-func (g *Gateway) usable(index int, id int64, now time.Time) bool {
-	return g.usableKey(index, streamKey{id: id}, now)
+// usable reports whether a source is healthy and outside all of its cooldowns.
+// This is the normal candidate test; attemptSources may still try a source that
+// is only cooling down as a whole backend when nothing else is available. Called
+// under mu.
+func (g *Gateway) usable(index int, key streamKey, now time.Time) bool {
+	return g.catalogHealthy(index, now) && !g.backendCooling(index, now) && !g.keyCooling(index, key, now)
 }
 
-// usableKey applies the same rules to service and channel streams. Called under mu.
-func (g *Gateway) usableKey(index int, key streamKey, now time.Time) bool {
+// catalogHealthy reports whether a source's catalog is fresh and healthy enough
+// to stream from. Called under mu.
+func (g *Gateway) catalogHealthy(index int, now time.Time) bool {
+	_, healthy := g.backends[index].status(now, time.Duration(g.config.MaxStaleSeconds)*time.Second)
+	return healthy
+}
+
+// backendCooling reports whether the whole backend is cooling down after a failed
+// stream. Called under mu.
+func (g *Gateway) backendCooling(index int, now time.Time) bool {
+	return now.Before(g.backends[index].blockedUntil)
+}
+
+// keyCooling reports whether this service or channel is cooling down, which is a
+// tuner shortage or similar per-stream failure. Called under mu.
+func (g *Gateway) keyCooling(index int, key streamKey, now time.Time) bool {
 	b := &g.backends[index]
-	_, healthy := b.status(now, time.Duration(g.config.MaxStaleSeconds)*time.Second)
-	if !healthy || now.Before(b.blockedUntil) {
-		return false
-	}
 	if key.channel != "" {
-		return !now.Before(b.blockedChannels[key.channelType+"/"+key.channel])
+		return now.Before(b.blockedChannels[key.channelType+"/"+key.channel])
 	}
-	return !now.Before(b.blockedServices[key.id])
+	return now.Before(b.blockedServices[key.id])
+}
+
+// attemptSources picks the sources a stream request may try and reports whether
+// they are cooling as a whole backend (rescue attempts). Normally it returns the
+// sources outside all of their cooldowns; when there are none, it returns the
+// healthy sources whose only cooldown is the backend-wide one, so a sole upstream
+// that recovered is not locked out for the whole cooldown window. A service or
+// channel cooldown (a tuner shortage, for example) is kept even then, and an
+// unhealthy source (stale or failed catalog) is never returned. Called under mu.
+func (g *Gateway) attemptSources(sources []source, key streamKey, now time.Time) ([]source, bool) {
+	var ready, cooling []source
+	for _, s := range sources {
+		switch {
+		case !g.catalogHealthy(s.backend, now):
+		case g.usable(s.backend, key, now):
+			ready = append(ready, s)
+		case g.backendCooling(s.backend, now) && !g.keyCooling(s.backend, key, now):
+			cooling = append(cooling, s)
+		}
+	}
+	if len(ready) > 0 {
+		return ready, false
+	}
+	return cooling, len(cooling) > 0
 }
 
 // blockKey cools a backend (or only one service/channel of it) down for 10 seconds.

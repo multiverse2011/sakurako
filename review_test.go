@@ -193,21 +193,52 @@ func TestHTTPBoundaries(t *testing.T) {
 
 func TestCooldownScopeAndHEAD(t *testing.T) {
 	g, s := gateway(t, newFake(t, 10, "x"))
+	head := func() int {
+		t.Helper()
+		req, _ := http.NewRequest("HEAD", s.URL+"/api/services/1000101/stream", nil)
+		resp, err := testClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
 	g.block(0, 1000101, true, "test")
 	g.mu.RLock()
-	svcBlocked, otherOK := !g.usable(0, 1000101, time.Now()), g.usable(0, 42, time.Now())
+	svcUntil := g.backends[0].blockedServices[1000101]
+	svcBlocked, otherOK := !g.usable(0, streamKey{id: 1000101}, time.Now()), g.usable(0, streamKey{id: 42}, time.Now())
 	g.mu.RUnlock()
 	if !svcBlocked || !otherOK {
 		t.Fatal("service-only cooldown must not affect other services")
 	}
-	req, _ := http.NewRequest("HEAD", s.URL+"/api/services/1000101/stream", nil)
-	resp, err := testClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	// A service cooldown is respected even when it is the only candidate; the
+	// rescue covers whole-backend cooldowns only.
+	withinCooldown(t, svcUntil, "before the HEAD request")
+	status := head()
+	withinCooldown(t, svcUntil, "after the HEAD response headers")
+	if status != 503 {
+		t.Fatalf("HEAD ignored the service cooldown: %d", status)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != 503 {
-		t.Fatalf("HEAD claimed playable while blocked: %d", resp.StatusCode)
+
+	// A whole-backend cooldown is still an attempt candidate when nothing else serves.
+	g.mu.Lock()
+	delete(g.backends[0].blockedServices, 1000101)
+	g.mu.Unlock()
+	g.block(0, 1000101, false, "test")
+	g.mu.RLock()
+	backendUntil := g.backends[0].blockedUntil
+	g.mu.RUnlock()
+	withinCooldown(t, backendUntil, "before the HEAD request")
+	status = head()
+	withinCooldown(t, backendUntil, "after the HEAD response headers")
+	if status != 200 {
+		t.Fatalf("HEAD disagreed with the attempt decision: %d", status)
+	}
+
+	changeBackend(g, 0, func(b *backend) { b.healthy = false })
+	if status = head(); status != 503 {
+		t.Fatalf("HEAD claimed a candidate while unhealthy: %d", status)
 	}
 }
 
