@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -103,7 +104,9 @@ func formatLogBytes(n int64) string {
 		return fmt.Sprintf("%d B", n)
 	}
 	v, i := float64(n)/1024, 0
-	for v >= 1024 && i < len(units)-1 {
+	// Advance when one decimal would round to 1024, so 1048575 bytes prints
+	// "1.0 MiB" rather than "1024.0 KiB".
+	for i < len(units)-1 && math.Round(v*10) >= 10240 {
 		v /= 1024
 		i++
 	}

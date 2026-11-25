@@ -1302,7 +1302,9 @@ func TestFormatLogBytes(t *testing.T) {
 		{1023, "1023 B"},
 		{1024, "1.0 KiB"},
 		{1536, "1.5 KiB"},
+		{1048575, "1.0 MiB"}, // 1023.999 KiB rounds to 1024.0 at one decimal
 		{1 << 20, "1.0 MiB"},
+		{1073741823, "1.0 GiB"},
 		{3328599654, "3.1 GiB"},
 		{2 << 40, "2.0 TiB"},
 	} {
