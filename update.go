@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -23,7 +24,7 @@ var (
 // from Gateway.mu so a check never holds it while waiting on GitHub.
 type updateCache struct {
 	mu     sync.Mutex
-	latest object // {"version","url"}; nil until a check finds a newer release
+	latest object // {"version","url"}; nil until a check finds a newer release, never mutated after set
 }
 
 func (c *updateCache) get() object {
@@ -63,12 +64,15 @@ func (g *Gateway) RunUpdateCheck(ctx context.Context) {
 	}
 }
 
-// checkUpdate records the newest stable release. A failure is logged once and
+// checkUpdate records the newest stable release. A failed check logs one line and
 // keeps the previous result, so the next interval retries without the header
 // losing what it already showed.
 func (g *Gateway) checkUpdate(ctx context.Context) {
 	latest, err := fetchLatestRelease(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return // a cancelled check is shutdown, not a failure
+		}
 		log.Printf("update check failed: %v", err)
 		return
 	}
@@ -108,12 +112,18 @@ func fetchLatestRelease(ctx context.Context) (object, error) {
 	if release.Draft || release.Prerelease || release.TagName == "" || !newerVersion(version, release.TagName) {
 		return nil, nil
 	}
+	// The link is opened by a browser, so only a real page URL is usable.
+	if link, err := url.Parse(release.HTMLURL); err != nil || (link.Scheme != "http" && link.Scheme != "https") || link.Host == "" {
+		return nil, nil
+	}
 	return object{"version": release.TagName, "url": release.HTMLURL}, nil
 }
 
-// newerVersion reports whether tag is a newer stable release than running.
-// shortcut: prerelease and build metadata are ignored, so the same core only
-// counts as newer when the running build is itself a prerelease.
+// newerVersion compares numeric cores only; callers exclude prerelease and
+// draft candidates themselves.
+// shortcut: prerelease and build metadata are ignored, so the same core counts as
+// newer only when the running build is a prerelease. Move to a SemVer
+// implementation when tag-side prerelease ordering is needed.
 func newerVersion(running, tag string) bool {
 	current, ok := versionCore(running)
 	if !ok {
@@ -128,7 +138,11 @@ func newerVersion(running, tag string) bool {
 			return n > current[i]
 		}
 	}
-	return strings.Contains(strings.TrimPrefix(strings.TrimSpace(running), "v"), "-")
+	core := strings.TrimPrefix(strings.TrimSpace(running), "v")
+	if i := strings.Index(core, "+"); i >= 0 {
+		core = core[:i]
+	}
+	return strings.Contains(core, "-")
 }
 
 // versionCore parses "v1.2.3[-pre][+build]" into its three numeric parts.

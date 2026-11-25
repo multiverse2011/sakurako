@@ -86,7 +86,7 @@ docker compose up -d
 | --- | --- | --- |
 | `SAKURAKO_UPDATE_CHECK` | `true` | `false` で GitHub Releases へのアップデート確認を無効にする |
 
-アップデート確認は起動時に 1 回、その後 6 時間ごとに GitHub Releases の最新安定版を確認し、稼働中のバージョンより新しいときだけ管理画面のロゴ横に `Update available (v0.5.0)` のリンクを表示します。比較できない `dev` ビルドでは表示しません。`false` にすると GitHub へは問い合わせませんが、稼働中のバージョンは表示されます。Docker Compose では `environment:` で渡せます。
+アップデート確認は起動時に 1 回、その後 6 時間ごとに GitHub Releases の最新安定版を確認し、稼働中のバージョンより新しいときだけ管理画面のロゴ横に `Update available (v0.5.0)` のリンクを表示します。比較できない `dev` ビルドでは表示しません。確認に失敗した場合は確認不能として扱い、次の確認で再試行します（稼働中のバージョンとダッシュボードはそのまま表示されます）。`false` にすると GitHub へは問い合わせませんが、稼働中のバージョンは表示されます。Docker Compose では `environment:` で渡せます。
 
 ```yaml
 services:

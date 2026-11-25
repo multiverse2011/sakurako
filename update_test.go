@@ -51,14 +51,32 @@ func TestUpdateCheckOffersNewerStableRelease(t *testing.T) {
 			}))
 			t.Cleanup(s.Close)
 			setUpdateCheck(t, s.URL, time.Hour)
-			g, _ := gateway(t, newFake(t, 10, "service"))
+			g, server := gateway(t, newFake(t, 10, "service"))
 			g.checkUpdate(context.Background())
 			update := g.update.get()
 			if update["version"] != "v0.5.0" || update["url"] != "https://example.test/releases/v0.5.0" {
 				t.Fatalf("update: %v", update)
 			}
-			if got := <-agent; got != "Sakurako/"+running {
-				t.Fatalf("User-Agent: %q", got)
+			if got := g.uiState(time.Now())["update"].(object); got == nil {
+				t.Fatal("state has no update")
+			}
+			var wire struct {
+				Update *struct {
+					Version string `json:"version"`
+					URL     string `json:"url"`
+				} `json:"update"`
+			}
+			getJSON(t, server.URL+"/-/ui/state", 200, &wire)
+			if wire.Update == nil || wire.Update.Version != "v0.5.0" || wire.Update.URL != "https://example.test/releases/v0.5.0" {
+				t.Fatalf("state update: %+v", wire.Update)
+			}
+			select {
+			case got := <-agent:
+				if got != "Sakurako/"+running {
+					t.Fatalf("User-Agent: %q", got)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("no request reached the server")
 			}
 			if got := g.uiState(time.Now())["version"]; got != running {
 				t.Fatalf("state version: %v", got)
@@ -74,6 +92,9 @@ func TestUpdateCheckSilentWithoutNewerStableRelease(t *testing.T) {
 		{"dev build", "dev", `{"tag_name":"v0.5.0","html_url":"https://example.test/r"}`},
 		{"unparseable tag", "0.4.0", `{"tag_name":"nightly","html_url":"https://example.test/r"}`},
 		{"empty tag", "0.4.0", `{"html_url":"https://example.test/r"}`},
+		{"empty url", "0.4.0", `{"tag_name":"v0.5.0","html_url":""}`},
+		{"non-http url", "0.4.0", `{"tag_name":"v0.5.0","html_url":"javascript:alert(1)"}`},
+		{"build metadata with a dash", "0.5.0+build-1", `{"tag_name":"v0.5.0","html_url":"https://example.test/r"}`},
 		{"draft", "0.4.0", `{"tag_name":"v0.5.0","html_url":"https://example.test/r","draft":true}`},
 		{"prerelease", "0.4.0", `{"tag_name":"v0.5.0","html_url":"https://example.test/r","prerelease":true}`},
 	} {
@@ -161,7 +182,11 @@ func TestRunUpdateCheckRetriesOnInterval(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go g.RunUpdateCheck(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.RunUpdateCheck(ctx)
+	}()
 	deadline := time.Now().Add(2 * time.Second)
 	for g.update.get() == nil {
 		if time.Now().After(deadline) {
@@ -170,8 +195,62 @@ func TestRunUpdateCheckRetriesOnInterval(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunUpdateCheck did not stop after cancel")
+	}
 	if got := requests.Load(); got < 2 {
 		t.Fatalf("requests: %d, want a retry", got)
+	}
+}
+
+func TestUpdateCheckClearsStaleRelease(t *testing.T) {
+	setVersion(t, "0.4.0")
+	var stale atomic.Bool
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if stale.Load() {
+			io.WriteString(w, `{"tag_name":"v0.4.0","html_url":"https://example.test/r"}`)
+			return
+		}
+		io.WriteString(w, releaseBody)
+	}))
+	t.Cleanup(s.Close)
+	setUpdateCheck(t, s.URL, time.Hour)
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	g.checkUpdate(context.Background())
+	if g.update.get() == nil {
+		t.Fatal("first check found nothing")
+	}
+	stale.Store(true)
+	g.checkUpdate(context.Background())
+	if update := g.update.get(); update != nil {
+		t.Fatalf("stale release kept: %v", update)
+	}
+}
+
+func TestNewerVersion(t *testing.T) {
+	for _, tc := range []struct {
+		running, tag string
+		want         bool
+	}{
+		{"0.4.0", "v0.5.0", true},
+		{"v0.4.0", "v0.5.0", true},
+		{"0.9.0", "v0.10.0", true},
+		{"0.10.0", "v0.9.0", false},
+		{"0.5.0", "v0.5.0", false},
+		{"1.0", "v1.1.0", false},
+		{"0.4.0", "v1.0", false},
+		{"0.4.0", "v0.5.0+build", true},
+		{"0.5.0+build", "v0.5.0", false},
+		{"0.5.0+build-1", "v0.5.0", false},
+		{"0.5.0-rc1", "v0.5.0", true},
+		{"nightly", "v0.5.0", false},
+		{"0.4.0", "nightly", false},
+	} {
+		if got := newerVersion(tc.running, tc.tag); got != tc.want {
+			t.Errorf("newerVersion(%q, %q) = %v, want %v", tc.running, tc.tag, got, tc.want)
+		}
 	}
 }
 
@@ -182,7 +261,16 @@ func TestUpdateCheckDisabledSkipsGitHub(t *testing.T) {
 	g, server := gateway(t, newFake(t, 10, "service"))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	g.RunUpdateCheck(ctx) // returns at once when disabled
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.RunUpdateCheck(ctx) // returns at once when disabled
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunUpdateCheck kept running while disabled")
+	}
 	var wire map[string]any
 	getJSON(t, server.URL+"/-/ui/state", 200, &wire)
 	if got := requests.Load(); got != 0 {
