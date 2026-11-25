@@ -177,6 +177,118 @@ func TestMidStreamUpstreamResetVsClientDisconnect(t *testing.T) {
 	})
 }
 
+// breakStream reads the first chunk of a mid-stream failure so the backend is
+// cooled down, then leaves the request.
+func breakStream(t *testing.T, g *Gateway, url string) {
+	t.Helper()
+	resp, err := testClient.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(resp.Body, make([]byte, 188)); err != nil {
+		t.Fatalf("first chunk: %v", err)
+	}
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Fatal("upstream reset looked like a complete stream")
+	}
+	resp.Body.Close()
+	waitStreamsDrained(t, g)
+	g.mu.RLock()
+	cooling := !g.backends[0].blockedUntil.IsZero()
+	g.mu.RUnlock()
+	if !cooling {
+		t.Fatal("mid-stream failure did not cool the backend")
+	}
+}
+
+// A sole source that failed mid-stream is cooled down, but it must still be
+// tried: once it recovered, the next request streams instead of waiting out the
+// whole cooldown.
+func TestSoleSourceRetriedDuringCooldown(t *testing.T) {
+	a := newFake(t, 10, "only")
+	a.resetAfterChunk = true
+	g, s := gateway(t, a)
+	breakStream(t, g, streamURL(s.URL, 1000101))
+
+	a.mu.Lock()
+	a.resetAfterChunk = false
+	a.mu.Unlock()
+
+	req, _ := http.NewRequest("HEAD", streamURL(s.URL, 1000101), nil)
+	head, err := testClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head.Body.Close()
+	if head.StatusCode != 200 {
+		t.Fatalf("HEAD on the cooling sole source: HTTP %d", head.StatusCode)
+	}
+
+	resp, err := testClient.Get(streamURL(s.URL, 1000101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		t.Fatalf("recovered sole source: HTTP %d", resp.StatusCode)
+	}
+	if body := readStreamBody(t, resp); body != "transport-stream" {
+		t.Fatalf("bad body %q", body)
+	}
+	resp.Body.Close()
+	waitCancel(t, a)
+}
+
+// The same rescue applies to channel streams.
+func TestSoleChannelSourceRetriedDuringCooldown(t *testing.T) {
+	a := newFake(t, 10, "only")
+	a.resetAfterChunk = true
+	g, s := gateway(t, a)
+	name := g.channelName(g.config.Backends[0], "27")
+	url := s.URL + "/api/channels/GR/" + name + "/stream"
+	breakStream(t, g, url)
+
+	a.mu.Lock()
+	a.resetAfterChunk = false
+	a.mu.Unlock()
+
+	resp, err := testClient.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		t.Fatalf("recovered sole channel source: HTTP %d", resp.StatusCode)
+	}
+	if body := readStreamBody(t, resp); body != "transport-stream" {
+		t.Fatalf("bad body %q", body)
+	}
+	resp.Body.Close()
+	waitCancel(t, a)
+}
+
+// A cooling source stays a last resort: while another source is usable it is not
+// tried, even though that usable source fails.
+func TestCoolingSourceIsNotTriedWhileAnotherIsUsable(t *testing.T) {
+	a, b := newFake(t, 10, "primary"), newFake(t, 10, "backup")
+	b.streamStatus = 503
+	g, s := gateway(t, a, b)
+	g.block(0, 1000101, false, "test")
+
+	resp, err := testClient.Get(streamURL(s.URL, 1000101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatalf("HTTP %d, want 503", resp.StatusCode)
+	}
+	if a.streamCalls.Load() != 0 {
+		t.Fatal("cooling source was tried while another source was usable")
+	}
+}
+
 func TestSameDomainDifferentChannelTypeConflicts(t *testing.T) {
 	_, s := conflictGateway(t)
 	var services, programs []object

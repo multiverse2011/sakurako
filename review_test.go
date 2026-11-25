@@ -200,14 +200,26 @@ func TestCooldownScopeAndHEAD(t *testing.T) {
 	if !svcBlocked || !otherOK {
 		t.Fatal("service-only cooldown must not affect other services")
 	}
+	// A cooling source is still attempted when nothing else can serve, so HEAD and
+	// GET agree on playability.
 	req, _ := http.NewRequest("HEAD", s.URL+"/api/services/1000101/stream", nil)
 	resp, err := testClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("HEAD disagreed with the attempt decision: %d", resp.StatusCode)
+	}
+
+	changeBackend(g, 0, func(b *backend) { b.healthy = false })
+	resp, err = testClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
 	if resp.StatusCode != 503 {
-		t.Fatalf("HEAD claimed playable while blocked: %d", resp.StatusCode)
+		t.Fatalf("HEAD claimed playable while unhealthy: %d", resp.StatusCode)
 	}
 }
 
