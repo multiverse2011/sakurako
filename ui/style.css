@@ -43,6 +43,10 @@
 #refresh:disabled{opacity:.5;cursor:default;background:var(--surface,#fff);color:var(--muted,#606775)}
 
 header nav{flex:1}
+/* Logo, version and update link stay together; min-width lets the brand shrink and wrap instead of pushing the nav out on narrow screens. */
+.brand{display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap}
+#version{font-size:13px;color:var(--muted);white-space:nowrap}
+.update-link{font-size:12px;color:var(--accent);text-decoration:none;white-space:nowrap}.update-link:hover{text-decoration:underline}
 /* The desktop row needs 689.39px before gaps and padding. Subtract the 36px left padding and round up to 654px. */
 /* Use some right padding at 801–805px (through 820px with a 15px scrollbar). Restore main's 40px gaps at 806px of client width. */
 @media(min-width:801px){header{column-gap:min(40px,calc((100% - 654px) / 2))}}
