@@ -364,7 +364,9 @@ func TestCoolingSourceIsNotTriedWhileAnotherIsUsable(t *testing.T) {
 func TestCandidateCooledMidRequestIsSkipped(t *testing.T) {
 	a, b, c := newFake(t, 10, "A"), newFake(t, 10, "B"), newFake(t, 10, "C")
 	a.hold = make(chan struct{})
-	g, s := gateway(t, a, b, c)
+	// The long stream timeout is only a hang guard: A must fail when the test
+	// releases it, never on its own, so B is not reached before it is cooled down.
+	g, s := gatewayWithTimeouts(t, 1, 30, a, b, c)
 
 	type result struct {
 		status int
