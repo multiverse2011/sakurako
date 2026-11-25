@@ -50,7 +50,7 @@ func readConfig(path string) (Config, error) {
 		return Config{}, err
 	}
 	defer f.Close()
-	c := Config{Listen: ":40772", SyncSeconds: 30, CatalogTimeoutSeconds: 10, MaxStaleSeconds: 3600, StreamTimeoutSeconds: 30, ChannelNames: "virtual"}
+	c := Config{Listen: ":40772", SyncSeconds: 30, CatalogTimeoutSeconds: 20, MaxStaleSeconds: 3600, StreamTimeoutSeconds: 30, ChannelNames: "virtual"}
 	d := json.NewDecoder(f)
 	d.DisallowUnknownFields()
 	if err := d.Decode(&c); err != nil {

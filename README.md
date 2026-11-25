@@ -65,7 +65,7 @@ docker compose up -d
 | `backends[].service_domain` | 接続先ごとに区別 | 同じ放送を提供する接続先を冗長化する場合に、同じ値を指定 |
 | `channel_names` | `virtual` | チャンネル名に接続先の ID を付加。`upstream` で元の名前を使用 |
 | `sync_seconds` | `30` | 番組情報などの同期間隔（秒） |
-| `catalog_timeout_seconds` | `10` | 接続先ごとの情報取得の制限時間（秒） |
+| `catalog_timeout_seconds` | `20` | 接続先ごとの情報取得の制限時間（秒） |
 | `max_stale_seconds` | `3600` | 最後に取得できた情報の有効期間（秒） |
 | `stream_timeout_seconds` | `30` | 配信の接続・読み書きの制限時間（秒） |
 
