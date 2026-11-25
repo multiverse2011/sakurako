@@ -301,6 +301,7 @@ func TestUIRendersAndPollsPerVisibleTab(t *testing.T) {
 		`||!tabPollsTuners()`,
 		`if(state&&tabPollsTuners()){renderTuners();renderBackends();}`,
 		`&&tabPollsTuners())tunerTimer=setTimeout(pollTuners,5000)`,
+		`setTimeout(()=>controller.abort(),25000)`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("/ui/app.js does not contain %s", want)
