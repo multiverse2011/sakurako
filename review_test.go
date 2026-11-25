@@ -195,13 +195,13 @@ func TestCooldownScopeAndHEAD(t *testing.T) {
 	g, s := gateway(t, newFake(t, 10, "x"))
 	g.block(0, 1000101, true, "test")
 	g.mu.RLock()
-	svcBlocked, otherOK := !g.usable(0, 1000101, time.Now()), g.usable(0, 42, time.Now())
+	svcBlocked, otherOK := !g.usable(0, streamKey{id: 1000101}, time.Now()), g.usable(0, streamKey{id: 42}, time.Now())
 	g.mu.RUnlock()
 	if !svcBlocked || !otherOK {
 		t.Fatal("service-only cooldown must not affect other services")
 	}
-	// A cooling source is still attempted when nothing else can serve, so HEAD and
-	// GET agree on playability.
+	// A cooling source is still an attempt candidate when nothing else can serve,
+	// so HEAD and GET agree.
 	req, _ := http.NewRequest("HEAD", s.URL+"/api/services/1000101/stream", nil)
 	resp, err := testClient.Do(req)
 	if err != nil {

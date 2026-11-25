@@ -265,7 +265,7 @@ func (g *Gateway) uiState(now time.Time) object {
 		preferred := ""
 		for _, source := range cat.sources[id] {
 			b := g.backends[source.backend]
-			available := g.usable(source.backend, id, now)
+			available := g.usable(source.backend, streamKey{id: id}, now)
 			candidates = append(candidates, object{"id": b.config.ID, "available": available})
 			if preferred == "" && available {
 				preferred = b.config.ID

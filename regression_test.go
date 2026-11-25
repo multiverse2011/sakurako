@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -178,26 +179,36 @@ func TestMidStreamUpstreamResetVsClientDisconnect(t *testing.T) {
 }
 
 // breakStream reads the first chunk of a mid-stream failure so the backend is
-// cooled down, then leaves the request.
-func breakStream(t *testing.T, g *Gateway, url string) {
+// cooled down, then leaves the request. It returns the cooldown deadline.
+func breakStream(t *testing.T, g *Gateway, url string) time.Time {
 	t.Helper()
 	resp, err := testClient.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 	if _, err := io.ReadFull(resp.Body, make([]byte, 188)); err != nil {
 		t.Fatalf("first chunk: %v", err)
 	}
 	if _, err := io.ReadAll(resp.Body); err == nil {
 		t.Fatal("upstream reset looked like a complete stream")
 	}
-	resp.Body.Close()
 	waitStreamsDrained(t, g)
 	g.mu.RLock()
-	cooling := !g.backends[0].blockedUntil.IsZero()
+	until := g.backends[0].blockedUntil
 	g.mu.RUnlock()
-	if !cooling {
+	if until.IsZero() {
 		t.Fatal("mid-stream failure did not cool the backend")
+	}
+	return until
+}
+
+// A stalled test process must not let the cooldown expire unnoticed, which would
+// make a passing request indistinguishable from a rescue.
+func withinCooldown(t *testing.T, until time.Time) {
+	t.Helper()
+	if !time.Now().Before(until) {
+		t.Fatal("cooldown expired before the request; the rescue was not exercised")
 	}
 }
 
@@ -208,12 +219,13 @@ func TestSoleSourceRetriedDuringCooldown(t *testing.T) {
 	a := newFake(t, 10, "only")
 	a.resetAfterChunk = true
 	g, s := gateway(t, a)
-	breakStream(t, g, streamURL(s.URL, 1000101))
+	until := breakStream(t, g, streamURL(s.URL, 1000101))
 
 	a.mu.Lock()
 	a.resetAfterChunk = false
 	a.mu.Unlock()
 
+	withinCooldown(t, until)
 	req, _ := http.NewRequest("HEAD", streamURL(s.URL, 1000101), nil)
 	head, err := testClient.Do(req)
 	if err != nil {
@@ -224,12 +236,13 @@ func TestSoleSourceRetriedDuringCooldown(t *testing.T) {
 		t.Fatalf("HEAD on the cooling sole source: HTTP %d", head.StatusCode)
 	}
 
+	withinCooldown(t, until)
 	resp, err := testClient.Get(streamURL(s.URL, 1000101))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		resp.Body.Close()
 		t.Fatalf("recovered sole source: HTTP %d", resp.StatusCode)
 	}
 	if body := readStreamBody(t, resp); body != "transport-stream" {
@@ -239,25 +252,41 @@ func TestSoleSourceRetriedDuringCooldown(t *testing.T) {
 	waitCancel(t, a)
 }
 
-// The same rescue applies to channel streams.
+// The same rescue applies to channel streams, and HEAD must not open a connection.
 func TestSoleChannelSourceRetriedDuringCooldown(t *testing.T) {
 	a := newFake(t, 10, "only")
 	a.resetAfterChunk = true
 	g, s := gateway(t, a)
 	name := g.channelName(g.config.Backends[0], "27")
 	url := s.URL + "/api/channels/GR/" + name + "/stream"
-	breakStream(t, g, url)
+	until := breakStream(t, g, url)
 
 	a.mu.Lock()
 	a.resetAfterChunk = false
 	a.mu.Unlock()
 
+	calls := a.streamCalls.Load()
+	withinCooldown(t, until)
+	req, _ := http.NewRequest("HEAD", url, nil)
+	head, err := testClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head.Body.Close()
+	if head.StatusCode != 200 {
+		t.Fatalf("HEAD on the cooling sole channel: HTTP %d", head.StatusCode)
+	}
+	if got := a.streamCalls.Load(); got != calls {
+		t.Fatalf("HEAD opened %d upstream connections", got-calls)
+	}
+
+	withinCooldown(t, until)
 	resp, err := testClient.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		resp.Body.Close()
 		t.Fatalf("recovered sole channel source: HTTP %d", resp.StatusCode)
 	}
 	if body := readStreamBody(t, resp); body != "transport-stream" {
@@ -265,6 +294,34 @@ func TestSoleChannelSourceRetriedDuringCooldown(t *testing.T) {
 	}
 	resp.Body.Close()
 	waitCancel(t, a)
+}
+
+// A rescue attempt on a source that has not actually recovered is still made
+// once, and the gateway then reports 503.
+func TestSoleSourceRescueFailureReturns503(t *testing.T) {
+	a := newFake(t, 10, "only")
+	a.resetAfterChunk = true
+	g, s := gateway(t, a)
+	until := breakStream(t, g, streamURL(s.URL, 1000101))
+
+	a.mu.Lock()
+	a.resetAfterChunk = false
+	a.streamStatus = 503
+	a.mu.Unlock()
+
+	calls := a.streamCalls.Load()
+	withinCooldown(t, until)
+	resp, err := testClient.Get(streamURL(s.URL, 1000101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatalf("unrecovered sole source: HTTP %d, want 503", resp.StatusCode)
+	}
+	if got := a.streamCalls.Load(); got != calls+1 {
+		t.Fatalf("upstream calls = %d, want %d", got, calls+1)
+	}
 }
 
 // A cooling source stays a last resort: while another source is usable it is not
@@ -279,14 +336,110 @@ func TestCoolingSourceIsNotTriedWhileAnotherIsUsable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
 	if resp.StatusCode != 503 {
 		t.Fatalf("HTTP %d, want 503", resp.StatusCode)
 	}
 	if a.streamCalls.Load() != 0 {
 		t.Fatal("cooling source was tried while another source was usable")
 	}
+	if b.streamCalls.Load() != 1 {
+		t.Fatalf("usable source calls = %d, want 1", b.streamCalls.Load())
+	}
+}
+
+// A source that another stream cools down while this request waits on an earlier
+// source must be skipped; the next usable source serves instead.
+func TestCandidateCooledMidRequestIsSkipped(t *testing.T) {
+	a, b, c := newFake(t, 10, "A"), newFake(t, 10, "B"), newFake(t, 10, "C")
+	a.stall = true // holds A until the first-byte timeout, without a test sleep
+	g, s := gateway(t, a, b, c)
+
+	type result struct {
+		status int
+		body   string
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := testClient.Get(streamURL(s.URL, 1000101))
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, len("transport-stream"))
+		_, err = io.ReadFull(resp.Body, buf)
+		done <- result{status: resp.StatusCode, body: string(buf), err: err}
+	}()
+
+	// A is being tried; cool B down before the request reaches it.
+	waitStarted(t, a)
+	g.block(1, 1000101, false, "test")
+
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.status != 200 || got.body != "transport-stream" {
+		t.Fatalf("HTTP %d body %q", got.status, got.body)
+	}
+	if b.streamCalls.Load() != 0 {
+		t.Fatal("source cooled down mid-request was still tried")
+	}
+	if c.streamCalls.Load() != 1 {
+		t.Fatalf("third source calls = %d, want 1", c.streamCalls.Load())
+	}
+	waitCancel(t, a)
+	waitCancel(t, c)
+}
+
+// attemptSources prefers sources outside their cooldown and falls back to healthy
+// cooling ones only when there are no others.
+func TestAttemptSourcesSelection(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "A"), newFake(t, 10, "B"), newFake(t, 10, "C"))
+	sources := []source{{backend: 0}, {backend: 1}, {backend: 2}}
+	key := streamKey{id: 1000101}
+	now := time.Now()
+
+	selected := func(at time.Time) ([]int, bool) {
+		t.Helper()
+		g.mu.RLock()
+		defer g.mu.RUnlock()
+		got, rescue := g.attemptSources(sources, key, at)
+		backends := make([]int, len(got))
+		for i, s := range got {
+			backends[i] = s.backend
+		}
+		return backends, rescue
+	}
+	edit := func(i int, fn func(*backend)) {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		fn(&g.backends[i])
+	}
+	cool := func(i int) { edit(i, func(b *backend) { b.blockedUntil = now.Add(time.Second) }) }
+	want := func(at time.Time, backends []int, rescue bool) {
+		t.Helper()
+		got, gotRescue := selected(at)
+		if !slices.Equal(got, backends) || gotRescue != rescue {
+			t.Fatalf("attemptSources = %v rescue=%v, want %v rescue=%v", got, gotRescue, backends, rescue)
+		}
+	}
+
+	want(now, []int{0, 1, 2}, false)
+	cool(1)
+	want(now, []int{0, 2}, false)
+	cool(0)
+	want(now, []int{2}, false)
+	cool(2)
+	want(now, []int{0, 1, 2}, true)
+	// Expired cooldowns are normal candidates again.
+	want(now.Add(2*time.Second), []int{0, 1, 2}, false)
+	// An unhealthy source is never a candidate, even as a rescue.
+	edit(1, func(b *backend) { b.healthy = false })
+	want(now, []int{0, 2}, true)
 }
 
 func TestSameDomainDifferentChannelTypeConflicts(t *testing.T) {
@@ -781,8 +934,8 @@ func TestCooldownExpiresAfterTenSeconds(t *testing.T) {
 
 	now := time.Now()
 	g.mu.RLock()
-	blockedNow := g.usable(0, 42, now)
-	usableLater := g.usable(0, 42, now.Add(11*time.Second))
+	blockedNow := g.usable(0, streamKey{id: 42}, now)
+	usableLater := g.usable(0, streamKey{id: 42}, now.Add(11*time.Second))
 	g.mu.RUnlock()
 	if blockedNow {
 		t.Fatal("blocked backend reported usable immediately")
@@ -864,7 +1017,7 @@ func TestConcurrentSyncAndCooldownRace(t *testing.T) {
 		for i := 0; i < 75; i++ {
 			g.block(0, 1000101, i%2 == 0, "test")
 			g.mu.RLock()
-			_ = g.usable(0, 1000101, time.Now())
+			_ = g.usable(0, streamKey{id: 1000101}, time.Now())
 			g.mu.RUnlock()
 		}
 	}()
