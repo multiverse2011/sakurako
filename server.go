@@ -463,12 +463,15 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 			return
 		}
 		// A normal candidate may have been cooled down by another stream while an
-		// earlier source was being tried. A rescue candidate is cooling by design.
+		// earlier source was being tried. A rescue candidate is cooling as a whole
+		// backend, but its service or channel may still have its own cooldown.
 		g.mu.RLock()
 		now := time.Now()
 		ok := g.catalogHealthy(s.backend, now)
-		if !rescue {
-			ok = ok && g.keyAvailable(s.backend, w.key, now)
+		if rescue {
+			ok = ok && !g.keyCooling(s.backend, w.key, now)
+		} else {
+			ok = ok && g.usable(s.backend, w.key, now)
 		}
 		g.mu.RUnlock()
 		if !ok {
@@ -591,11 +594,12 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 	apiError(w, 503, "no healthy source could start the stream")
 }
 
-// usable reports whether a source is healthy and outside its stream cooldown.
-// This is the normal candidate test; attemptSources may still try a cooling
-// source when nothing else is available. Called under mu.
+// usable reports whether a source is healthy and outside all of its cooldowns.
+// This is the normal candidate test; attemptSources may still try a source that
+// is only cooling down as a whole backend when nothing else is available. Called
+// under mu.
 func (g *Gateway) usable(index int, key streamKey, now time.Time) bool {
-	return g.catalogHealthy(index, now) && g.keyAvailable(index, key, now)
+	return g.catalogHealthy(index, now) && !g.backendCooling(index, now) && !g.keyCooling(index, key, now)
 }
 
 // catalogHealthy reports whether a source's catalog is fresh and healthy enough
@@ -605,33 +609,37 @@ func (g *Gateway) catalogHealthy(index int, now time.Time) bool {
 	return healthy
 }
 
-// keyAvailable reports whether a service or channel stream is outside its
-// cooldown. Called under mu.
-func (g *Gateway) keyAvailable(index int, key streamKey, now time.Time) bool {
+// backendCooling reports whether the whole backend is cooling down after a failed
+// stream. Called under mu.
+func (g *Gateway) backendCooling(index int, now time.Time) bool {
+	return now.Before(g.backends[index].blockedUntil)
+}
+
+// keyCooling reports whether this service or channel is cooling down, which is a
+// tuner shortage or similar per-stream failure. Called under mu.
+func (g *Gateway) keyCooling(index int, key streamKey, now time.Time) bool {
 	b := &g.backends[index]
-	if now.Before(b.blockedUntil) {
-		return false
-	}
 	if key.channel != "" {
-		return !now.Before(b.blockedChannels[key.channelType+"/"+key.channel])
+		return now.Before(b.blockedChannels[key.channelType+"/"+key.channel])
 	}
-	return !now.Before(b.blockedServices[key.id])
+	return now.Before(b.blockedServices[key.id])
 }
 
 // attemptSources picks the sources a stream request may try and reports whether
-// they are only cooling down (rescue attempts). Normally it returns the sources
-// outside their cooldown; when there are none, it returns the healthy sources
-// that are only cooling down, so a sole upstream that recovered is not locked out
-// for the whole cooldown window. An unhealthy source (stale or failed catalog) is
-// never returned. Called under mu.
+// they are cooling as a whole backend (rescue attempts). Normally it returns the
+// sources outside all of their cooldowns; when there are none, it returns the
+// healthy sources whose only cooldown is the backend-wide one, so a sole upstream
+// that recovered is not locked out for the whole cooldown window. A service or
+// channel cooldown (a tuner shortage, for example) is kept even then, and an
+// unhealthy source (stale or failed catalog) is never returned. Called under mu.
 func (g *Gateway) attemptSources(sources []source, key streamKey, now time.Time) ([]source, bool) {
 	var ready, cooling []source
 	for _, s := range sources {
 		switch {
 		case !g.catalogHealthy(s.backend, now):
-		case g.keyAvailable(s.backend, key, now):
+		case g.usable(s.backend, key, now):
 			ready = append(ready, s)
-		default:
+		case g.backendCooling(s.backend, now) && !g.keyCooling(s.backend, key, now):
 			cooling = append(cooling, s)
 		}
 	}

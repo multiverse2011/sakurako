@@ -359,6 +359,45 @@ func TestCoolingSourceIsNotTriedWhileAnotherIsUsable(t *testing.T) {
 	}
 }
 
+// A service cooldown (a tuner shortage, for example) is not rescued even when it
+// is the only candidate; only a whole-backend cooldown is.
+func TestServiceCooldownIsNotRescued(t *testing.T) {
+	a := newFake(t, 10, "only")
+	g, s := gateway(t, a)
+	g.block(0, 1000101, true, "test")
+	g.mu.RLock()
+	until := g.backends[0].blockedServices[1000101]
+	g.mu.RUnlock()
+
+	withinCooldown(t, until, "before the GET request")
+	resp, err := testClient.Get(streamURL(s.URL, 1000101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	withinCooldown(t, until, "after the GET response headers")
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != 503 {
+		t.Fatalf("GET HTTP %d, want 503", resp.StatusCode)
+	}
+	if a.streamCalls.Load() != 0 {
+		t.Fatal("service cooldown was rescued")
+	}
+
+	req, _ := http.NewRequest("HEAD", streamURL(s.URL, 1000101), nil)
+	head, err := testClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head.Body.Close()
+	if head.StatusCode != 503 {
+		t.Fatalf("HEAD HTTP %d, want 503", head.StatusCode)
+	}
+	if a.streamCalls.Load() != 0 {
+		t.Fatal("HEAD opened an upstream connection for a service cooldown")
+	}
+}
+
 // A source that another stream cools down while this request waits on an earlier
 // source must be skipped; the next usable source serves instead.
 func TestCandidateCooledMidRequestIsSkipped(t *testing.T) {
@@ -412,8 +451,8 @@ func TestCandidateCooledMidRequestIsSkipped(t *testing.T) {
 	waitCancel(t, c)
 }
 
-// attemptSources prefers sources outside their cooldown and falls back to healthy
-// cooling ones only when there are no others.
+// attemptSources prefers sources outside their cooldowns and falls back to healthy
+// sources that are only cooling as a whole backend when there are no others.
 func TestAttemptSourcesSelection(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "A"), newFake(t, 10, "B"), newFake(t, 10, "C"))
 	sources := []source{{backend: 0}, {backend: 1}, {backend: 2}}
@@ -454,9 +493,14 @@ func TestAttemptSourcesSelection(t *testing.T) {
 	want(now, []int{0, 1, 2}, true)
 	// Expired cooldowns are normal candidates again.
 	want(now.Add(2*time.Second), []int{0, 1, 2}, false)
-	// An unhealthy source is never a candidate, even as a rescue.
-	edit(1, func(b *backend) { b.healthy = false })
+	// A service cooldown is kept even in rescue mode.
+	edit(1, func(b *backend) {
+		b.blockedServices = map[int64]time.Time{key.id: now.Add(time.Second)}
+	})
 	want(now, []int{0, 2}, true)
+	// An unhealthy source is never a candidate, even as a rescue.
+	edit(0, func(b *backend) { b.healthy = false })
+	want(now, []int{2}, true)
 }
 
 func TestSameDomainDifferentChannelTypeConflicts(t *testing.T) {
