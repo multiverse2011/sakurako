@@ -43,23 +43,6 @@ func captureLog(t *testing.T) *logCapture {
 	return c
 }
 
-// waitLog returns the captured output once want has been logged. The line can be
-// written by a stream goroutine, so poll instead of reading once.
-func waitLog(t *testing.T, c *logCapture, want string) string {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		got := c.String()
-		if strings.Contains(got, want) {
-			return got
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("log line %q not found in:\n%s", want, got)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 func requireNotLogged(t *testing.T, got string, unwanted ...string) {
 	t.Helper()
 	for _, s := range unwanted {
@@ -651,49 +634,123 @@ func TestDecodeUnsetIsSeparateGroup(t *testing.T) {
 	}
 }
 
-// holdWriter blocks the subscriber's first write so its queue overflows without
-// depending on socket buffers draining at some speed.
-type holdWriter struct {
-	header  http.Header
-	release chan struct{}
+// runStream starts one shared stream against g with subs already attached and
+// returns the stream, its log capture and a channel closed after the upstream
+// goroutine has written its ending line.
+func runStream(t *testing.T, g *Gateway, key streamKey, sources []source, subs ...*subscriber) (*sharedStream, *logCapture, <-chan struct{}) {
+	t.Helper()
+	logs := captureLog(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	s := newSharedStream(g, "s1", key, "", cancel)
+	for _, sub := range subs {
+		s.subscribers[sub] = true
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.run(req, sources, streamOptions{})
+	}()
+	t.Cleanup(cancel)
+	return s, logs, done
 }
 
-func (w *holdWriter) Header() http.Header              { return w.header }
-func (w *holdWriter) WriteHeader(int)                  {}
-func (w *holdWriter) Flush()                           {}
-func (w *holdWriter) SetWriteDeadline(time.Time) error { return nil }
-func (w *holdWriter) Write(p []byte) (int, error) {
-	<-w.release
-	return len(p), nil
+// streamGateway has one healthy backend and no catalog; these tests drive the
+// shared stream directly and only need the backend to be usable.
+func streamGateway(t *testing.T, url string) *Gateway {
+	t.Helper()
+	g, err := NewGateway(Config{Listen: ":1", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 5, Backends: []BackendConfig{{ID: "a", URL: url}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.mu.Lock()
+	g.backends[0].healthy = true
+	g.backends[0].updated = time.Now()
+	g.mu.Unlock()
+	return g
 }
+
+// fixedTransport serves body for every stream request.
+type fixedTransport struct{ body func() io.ReadCloser }
+
+func (t fixedTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 200, Body: t.body()}, nil
+}
+
+// repeatBody returns the same chunk forever, like an upstream that never stops.
+type repeatBody struct{ chunk []byte }
+
+func (b *repeatBody) Read(p []byte) (int, error) { return copy(p, b.chunk), nil }
+func (b *repeatBody) Close() error               { return nil }
+
+// dataThenErrBody returns data first and err on the following Read.
+type dataThenErrBody struct {
+	data []byte
+	err  error
+}
+
+func (b *dataThenErrBody) Read(p []byte) (int, error) {
+	if len(b.data) == 0 {
+		return 0, b.err
+	}
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	return n, nil
+}
+
+func (b *dataThenErrBody) Close() error { return nil }
+
+// dataErrBody returns data and err from the same Read.
+type dataErrBody struct {
+	data []byte
+	err  error
+}
+
+func (b *dataErrBody) Read(p []byte) (int, error) {
+	if len(b.data) == 0 {
+		return 0, b.err
+	}
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	return n, b.err
+}
+
+func (b *dataErrBody) Close() error { return nil }
 
 func TestStreamEndLogsNormalClose(t *testing.T) {
-	a := newFake(t, 10, "A")
-	g, s := gateway(t, a)
-	channel := g.channelName(g.config.Backends[0], "27")
-	for _, tc := range []struct{ name, path, label string }{
-		{"service", streamURL(s.URL, 1000101), "service 1000101"},
-		{"channel", s.URL + "/api/channels/GR/" + channel + "/stream", "channel GR/" + channel},
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("transport-stream"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+	g := streamGateway(t, upstream.URL)
+	service := object{"channel": object{"type": "GR", "channel": "27"}}
+	for _, tc := range []struct {
+		name string
+		key  streamKey
+	}{
+		{"service", streamKey{id: 1000101}},
+		{"channel", streamKey{channelType: "GR", channel: "27"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := captureLog(t)
-			resp, err := testClient.Get(tc.path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// The fake sends exactly this one body, which fixes the byte count.
-			if body := readStreamBody(t, resp); body != "transport-stream" {
-				t.Fatalf("bad body %q", body)
-			}
-			resp.Body.Close()
-			waitCancel(t, a)
+			sub := newSubscriber()
+			s, logs, done := runStream(t, g, tc.key, []source{{backend: 0, service: service}}, sub)
+			<-sub.chunks // the only body chunk was read and handed to the subscriber
+			s.unsubscribe(sub)
+			<-done
 
-			got := waitLog(t, logs, tc.label+" via region0: ended after")
+			got := logs.String()
+			want := tc.key.label() + " via a: ended after "
+			if n := strings.Count(got, want); n != 1 {
+				t.Fatalf("end summary logged %d times:\n%s", n, got)
+			}
 			if !strings.Contains(got, ", 16 B") {
 				t.Fatalf("summary lacks the transferred size:\n%s", got)
-			}
-			if n := strings.Count(got, tc.label+" via region0: ended after"); n != 1 {
-				t.Fatalf("end summary logged %d times:\n%s", n, got)
 			}
 			requireNotLogged(t, got, "client disconnected", "context canceled", "aborted", "dropped")
 		})
@@ -701,93 +758,63 @@ func TestStreamEndLogsNormalClose(t *testing.T) {
 }
 
 func TestStreamEndLogsSlowDrop(t *testing.T) {
-	svc, prog := fixture(10, 101, "slow")
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/services":
-			respond(w, 200, []object{svc})
-			return
-		case "/api/programs":
-			respond(w, 200, []object{prog})
-			return
-		}
-		w.Header().Set("Content-Type", "video/MP2T")
-		w.WriteHeader(200)
-		chunk := bytes.Repeat([]byte{0x47}, 32*1024)
-		for {
-			if _, err := w.Write(chunk); err != nil {
-				return
-			}
-			w.(http.Flusher).Flush()
-		}
-	}))
-	defer upstream.Close()
-	g, err := NewGateway(Config{Listen: ":1", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 30, Backends: []BackendConfig{{ID: "a", URL: upstream.URL + "/api"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	g.Sync(context.Background())
-	channel := g.channelName(g.config.Backends[0], "27")
-	for _, tc := range []struct{ name, path, label string }{
-		{"service", "/api/services/1000101/stream", "service 1000101"},
-		{"channel", "/api/channels/GR/" + channel + "/stream", "channel GR/" + channel},
+	for _, tc := range []struct {
+		name string
+		key  streamKey
+	}{
+		{"service", streamKey{id: 2000101}},
+		{"channel", streamKey{channelType: "GR", channel: "28"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := captureLog(t)
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			rw := &holdWriter{header: http.Header{}, release: make(chan struct{})}
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				defer func() {
-					// The handler aborts the response once the stream ends.
-					if v := recover(); v != nil && v != http.ErrAbortHandler {
-						t.Errorf("stream handler panicked: %v", v)
-					}
-				}()
-				g.ServeHTTP(rw, httptest.NewRequest("GET", tc.path, nil).WithContext(ctx))
-			}()
-
-			got := waitLog(t, logs, "("+tc.label+" via a): dropping slow subscriber")
-			// The blocked handler cannot clean up, so an empty stream map means
-			// upstreamStream made its end-of-stream decision without a second line.
-			waitStreamsDrained(t, g)
-			close(rw.release)
+			g := streamGateway(t, "http://127.0.0.1:1")
+			g.streamClient = &http.Client{Transport: fixedTransport{body: func() io.ReadCloser {
+				return &repeatBody{chunk: bytes.Repeat([]byte{0x47}, 32*1024)}
+			}}}
+			service := object{"channel": object{"type": "GR", "channel": "28"}}
+			// Nothing drains the subscriber, so its queue overflows.
+			_, logs, done := runStream(t, g, tc.key, []source{{backend: 0, service: service}}, newSubscriber())
 			<-done
-			got = logs.String()
-			if n := strings.Count(got, "("+tc.label+" via a): dropping slow subscriber"); n != 1 {
+
+			got := logs.String()
+			want := "(" + tc.key.label() + " via a): dropping slow subscriber"
+			if n := strings.Count(got, want); n != 1 {
 				t.Fatalf("slow drop logged %d times:\n%s", n, got)
 			}
-			requireNotLogged(t, got, "client disconnected", "ended after", "aborted", "closed pipe", tc.label+" via a:")
+			requireNotLogged(t, got, "client disconnected", "ended after", "aborted", "closed pipe", tc.key.label()+" via a:")
 		})
 	}
 }
 
 func TestStreamEndLogsUpstreamFailure(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		setup func(*fakeBackend)
+		name   string
+		body   func() io.ReadCloser
+		reason string
+		full   bool // the write of the returned data finds the subscriber's queue full
 	}{
-		{"eof", func(f *fakeBackend) { f.end = true }},
-		{"mid-stream reset", func(f *fakeBackend) { f.resetAfterChunk = true }},
+		{"eof", func() io.ReadCloser { return &dataThenErrBody{data: make([]byte, 188), err: io.EOF} }, "EOF", false},
+		{"mid-stream reset", func() io.ReadCloser {
+			return &dataThenErrBody{data: make([]byte, 188), err: io.ErrUnexpectedEOF}
+		}, "unexpected EOF", false},
+		{"data and error", func() io.ReadCloser {
+			return &dataErrBody{data: make([]byte, 188), err: io.ErrUnexpectedEOF}
+		}, "unexpected EOF", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := captureLog(t)
-			a := newFake(t, 10, "A")
-			a.mu.Lock()
-			tc.setup(a)
-			a.mu.Unlock()
-			_, s := gateway(t, a)
-
-			resp, err := testClient.Get(streamURL(s.URL, 1000101))
-			if err != nil {
-				t.Fatal(err)
+			g := streamGateway(t, "http://127.0.0.1:1")
+			g.streamClient = &http.Client{Transport: fixedTransport{body: tc.body}}
+			sub := newSubscriber()
+			if tc.full {
+				for i := 0; i < subscriberQueueSize; i++ {
+					sub.chunks <- []byte{0x47}
+				}
 			}
-			defer resp.Body.Close()
+			_, logs, done := runStream(t, g, streamKey{id: 3000101}, []source{{backend: 0, service: object{}}}, sub)
+			<-done
 
-			got := waitLog(t, logs, "service 1000101 via region0 aborted: ")
-			if n := strings.Count(got, "service 1000101 via region0 aborted: "); n != 1 {
+			got := logs.String()
+			want := "service 3000101 via a aborted: " + tc.reason
+			if n := strings.Count(got, want); n != 1 {
 				t.Fatalf("upstream failure logged %d times:\n%s", n, got)
 			}
 			requireNotLogged(t, got, "client disconnected", "ended after", "dropped")
@@ -796,35 +823,23 @@ func TestStreamEndLogsUpstreamFailure(t *testing.T) {
 }
 
 func TestStreamEndLogsBeforeStart(t *testing.T) {
-	logs := captureLog(t)
-	a := newFake(t, 10, "A")
-	a.mu.Lock()
-	a.stall = true
-	a.mu.Unlock()
-	g, s := gateway(t, a)
-
-	// The response headers wait for the first byte, so the client must leave
-	// while the request is still in flight.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		req, _ := http.NewRequestWithContext(ctx, "GET", streamURL(s.URL, 1000101), nil)
-		if resp, err := testClient.Do(req); resp != nil {
-			resp.Body.Close()
-		} else if err != nil && ctx.Err() == nil {
-			t.Errorf("request failed before the client left: %v", err)
-		}
-	}()
-	waitStarted(t, a)
-	cancel()
+	started := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+	g := streamGateway(t, upstream.URL)
+	sub := newSubscriber()
+	s, logs, done := runStream(t, g, streamKey{id: 4000101}, []source{{backend: 0, service: object{}}}, sub)
+	<-started
+	s.unsubscribe(sub)
 	<-done
-	waitCancel(t, a)
-	waitStreamsDrained(t, g)
-	// Nothing is logged in this case; let the stream goroutine settle first.
-	time.Sleep(50 * time.Millisecond)
-	requireNotLogged(t, logs.String(), "client disconnected", "ended after", "aborted", "dropped")
+
+	// Leaving before the first byte is not a failure and has nothing to summarize.
+	requireNotLogged(t, logs.String(), "client disconnected", "ended after", "aborted", "dropped", "failed, cooling down")
 }
 
 func TestFormatLogDuration(t *testing.T) {

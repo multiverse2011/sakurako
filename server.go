@@ -516,8 +516,18 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 		}
 		buf := make([]byte, 32*1024)
 		n := 0
+		var readErr error
+		recordRead := func() {
+			// Record a read failure as soon as the read returns it. A subscriber
+			// leaving later (a canceled read or a failed write) must not relabel a
+			// confirmed upstream failure as a normal end.
+			if err != nil && ctx.Err() == nil {
+				readErr = err
+			}
+		}
 		if err == nil {
 			n, err = resp.Body.Read(buf)
+			recordRead()
 		}
 		if n == 0 {
 			if resp != nil {
@@ -543,7 +553,7 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 		}
 		controller := http.NewResponseController(w)
 		var cause error
-		clientGone, readFailed := false, false
+		clientGone := false
 		for {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				cause, clientGone = werr, true
@@ -554,12 +564,13 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 				break
 			}
 			if err != nil {
-				cause, readFailed = err, ctx.Err() == nil
+				cause = err
 				break
 			}
 			n, err = resp.Body.Read(buf)
+			recordRead()
 			if n == 0 {
-				cause, readFailed = err, ctx.Err() == nil
+				cause = err
 				break
 			}
 		}
@@ -568,9 +579,9 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 		if cause == nil {
 			cause = io.ErrNoProgress
 		}
-		// A read error that was not caused by our own cancel is the upstream's
-		// fault, even if every subscriber left while it was being handled.
-		if r.Context().Err() != nil && !readFailed {
+		if readErr != nil {
+			clientGone, cause = false, readErr
+		} else if r.Context().Err() != nil {
 			clientGone = true // client disconnect surfaces as a canceled upstream read
 		}
 		if clientGone {
