@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,7 +118,7 @@ func TestSharedStreamLifecycleAndOptions(t *testing.T) {
 	}
 }
 
-func TestSharedSlowSubscriberSurvivesShortStalls(t *testing.T) {
+func TestSharedQueueLimitIsBytes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fast := newSubscriber()
@@ -125,38 +126,57 @@ func TestSharedSlowSubscriberSurvivesShortStalls(t *testing.T) {
 	s := newSharedStream(nil, "s", streamKey{}, "", cancel)
 	s.subscribers[fast] = true
 	s.subscribers[slow] = true
-	chunk := make([]byte, 32<<10)
-	drain := func() { // mirrors the subscriber reader's accounting
-		fast.queued.Add(-int64(len(<-fast.chunks)))
-	}
-	for sent := 0; sent < subscriberQueueBytes; sent += len(chunk) {
-		if _, err := s.Write(chunk); err != nil {
+	fill := byte(0)
+	sent := 0
+	write := func(size int) {
+		t.Helper()
+		data := bytes.Repeat([]byte{fill}, size)
+		fill++
+		if _, err := s.Write(data); err != nil {
 			t.Fatal(err)
 		}
-		drain()
-		// Past 512 KiB (the old 16-chunk queue) but under the byte limit, a stall
-		// of a few seconds must not disconnect.
-		if sent >= 512<<10 {
-			select {
-			case <-slow.dropped:
-				t.Fatalf("dropped after %d bytes, below the %d byte limit", sent+len(chunk), subscriberQueueBytes)
-			default:
-			}
+		sent += size
+		got, ok := fast.dequeue()
+		if !ok {
+			t.Fatalf("fast subscriber did not receive the %d byte chunk", size)
+		}
+		if len(got) != size {
+			t.Fatalf("fast subscriber got %d of %d bytes", len(got), size)
+		}
+		select {
+		case <-slow.dropped:
+			t.Fatalf("slow subscriber dropped with %d bytes queued, below the %d byte limit", sent, subscriberQueueBytes)
+		default:
 		}
 	}
-	select {
-	case <-slow.dropped:
-		t.Fatal("slow subscriber not disconnected above the byte limit")
-	default:
+	// Mixed 8 KiB and 32 KiB reads: the limit counts bytes, not chunks.
+	for i := 0; ; i++ {
+		size := 32 << 10
+		if i%2 == 0 {
+			size = 8 << 10
+		}
+		if sent+size > subscriberQueueBytes {
+			break
+		}
+		write(size)
 	}
-	if _, err := s.Write(chunk); err != nil {
+	if sent < 8<<20 {
+		t.Fatalf("test only queued %d bytes", sent)
+	}
+	if sent < subscriberQueueBytes {
+		write(subscriberQueueBytes - sent)
+	}
+	// One byte over the limit drops only the slow subscriber.
+	if _, err := s.Write([]byte{0x47}); err != nil {
 		t.Fatal(err)
 	}
-	drain()
+	if _, ok := fast.dequeue(); !ok {
+		t.Fatal("fast subscriber did not receive the overflowing chunk")
+	}
 	select {
 	case <-slow.dropped:
 	default:
-		t.Fatal("slow subscriber not disconnected above the byte limit")
+		t.Fatalf("slow subscriber not dropped above the %d byte limit", subscriberQueueBytes)
 	}
 	if ctx.Err() != nil {
 		t.Fatal("slow subscriber canceled healthy stream")
@@ -173,7 +193,9 @@ func TestSharedLateJoinAlignment(t *testing.T) {
 		if _, err := s.Write([]byte{byte(i)}); err != nil {
 			t.Fatal(err)
 		}
-		<-fast.chunks
+		if _, ok := fast.dequeue(); !ok {
+			t.Fatal("fast subscriber did not receive the chunk")
+		}
 	}
 	// Upstream first byte is packet-aligned; a join after 17 bytes skips 171 bytes.
 	late := newSubscriber()
@@ -182,9 +204,155 @@ func TestSharedLateJoinAlignment(t *testing.T) {
 	data := make([]byte, 200)
 	data[171] = 0x47
 	s.Write(data)
-	got := <-late.chunks
+	got, _ := late.dequeue()
 	if len(got) != 29 || got[0] != 0x47 {
 		t.Fatalf("late join alignment: %d bytes, first %x", len(got), got[0])
+	}
+}
+
+// recordingWriter records the response body. When release is non-nil, Write
+// blocks until it is closed, standing in for a subscriber that stalls.
+type recordingWriter struct {
+	mu      sync.Mutex
+	header  http.Header
+	body    bytes.Buffer
+	updated chan struct{}
+	release <-chan struct{}
+}
+
+func newRecordingWriter(release <-chan struct{}) *recordingWriter {
+	return &recordingWriter{header: make(http.Header), updated: make(chan struct{}, 1), release: release}
+}
+
+func (w *recordingWriter) Header() http.Header { return w.header }
+func (w *recordingWriter) WriteHeader(int)     {}
+func (w *recordingWriter) SetWriteDeadline(time.Time) error {
+	return nil
+}
+func (w *recordingWriter) FlushError() error { return nil }
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	if w.release != nil {
+		<-w.release
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.body.Write(p)
+	select {
+	case w.updated <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+func (w *recordingWriter) size() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Len()
+}
+func (w *recordingWriter) contents() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.body.Bytes()...)
+}
+
+func TestSharedSubscriberStallResumesWithoutLoss(t *testing.T) {
+	data := make([]byte, 1<<20)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	started := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "video/MP2T")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		if _, err := w.Write(data); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+	g, err := NewGateway(Config{Listen: ":1", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 5, Backends: []BackendConfig{{ID: "a", URL: upstream.URL}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.backends[0].healthy = true
+	g.backends[0].updated = time.Now()
+	sources := []source{{backend: 0, service: object{"channel": map[string]any{"type": "GR"}}}}
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	open := func(w *recordingWriter) {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer func() { _ = recover() }() // sharedStream aborts with ErrAbortHandler
+			req, _ := http.NewRequestWithContext(ctx, "GET", "/", nil)
+			g.sharedStream(w, req, 1000101, sources, streamOptions{})
+		}()
+		t.Cleanup(func() {
+			cancel()
+			releaseOnce.Do(func() { close(release) })
+			<-done
+		})
+	}
+	waitSubscribers := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			g.streamsMu.Lock()
+			count := 0
+			for _, s := range g.streams {
+				s.mu.Lock()
+				count += len(s.subscribers)
+				s.mu.Unlock()
+			}
+			g.streamsMu.Unlock()
+			if count == n {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("did not reach %d subscribers", n)
+	}
+	waitSize := func(w *recordingWriter, want int) {
+		t.Helper()
+		timeout := time.After(5 * time.Second)
+		for w.size() < want {
+			select {
+			case <-w.updated:
+			case <-timeout:
+				t.Fatalf("received %d of %d bytes", w.size(), want)
+			}
+		}
+	}
+
+	fast := newRecordingWriter(nil)
+	open(fast)
+	waitSubscribers(1)
+	slow := newRecordingWriter(release)
+	open(slow)
+	waitSubscribers(2)
+	close(started)
+
+	// The stalled subscriber blocks on its first write while the other one
+	// keeps receiving the whole stream.
+	waitSize(fast, len(data))
+	if n := slow.size(); n != 0 {
+		t.Fatalf("stalled subscriber wrote %d bytes before resuming", n)
+	}
+	waitSubscribers(2) // the stalled subscriber is still attached
+	releaseOnce.Do(func() { close(release) })
+	waitSize(slow, len(data))
+	if got := fast.contents(); !bytes.Equal(got, data) {
+		t.Fatalf("fast subscriber lost data: %d bytes", len(got))
+	}
+	if got := slow.contents(); !bytes.Equal(got, data) {
+		t.Fatalf("stalled subscriber lost data after resuming: %d bytes", len(got))
 	}
 }
 

@@ -16,13 +16,10 @@ import (
 )
 
 // subscriberQueueBytes bounds how far a slow subscriber may fall behind: about
-// 5 seconds at BS 24 Mbps. Only exceeding it drops a subscriber; a longer stall
-// is cut by the subscriber's own write deadline (stream_timeout_seconds).
+// 5 seconds at BS 24 Mbps. Only exceeding it drops a subscriber, regardless of
+// how the upstream reads are split; a longer stall is cut by the subscriber's
+// own write deadline (stream_timeout_seconds).
 const subscriberQueueBytes = 16 << 20
-
-// subscriberQueueChunks bounds the pending chunk count for reads smaller than
-// the 32 KiB upstream buffer; the byte limit is the real bound.
-const subscriberQueueChunks = subscriberQueueBytes / (32 << 10)
 
 type streamKey struct {
 	id                                    int64  // service stream
@@ -42,9 +39,12 @@ type subscriber struct {
 	remote, userAgent string
 	joined            time.Time
 	bytes             atomic.Int64
-	queued            atomic.Int64 // bytes buffered in chunks, written and read concurrently
 
-	chunks  chan []byte
+	mu      sync.Mutex
+	queue   [][]byte // unread chunks; queue and queued are guarded by mu
+	queued  int
+	notify  chan struct{} // capacity 1: a chunk was queued
+	done    chan struct{} // closed when the stream ends
 	dropped chan struct{}
 	skip    int
 }
@@ -67,7 +67,39 @@ type sharedStream struct {
 }
 
 func newSubscriber() *subscriber {
-	return &subscriber{chunks: make(chan []byte, subscriberQueueChunks), dropped: make(chan struct{})}
+	return &subscriber{notify: make(chan struct{}, 1), done: make(chan struct{}), dropped: make(chan struct{})}
+}
+
+// enqueue queues a chunk unless it would exceed the byte limit. The writer never
+// blocks on a subscriber.
+func (sub *subscriber) enqueue(data []byte) bool {
+	sub.mu.Lock()
+	if sub.queued+len(data) > subscriberQueueBytes {
+		sub.mu.Unlock()
+		return false
+	}
+	sub.queue = append(sub.queue, data)
+	sub.queued += len(data)
+	sub.mu.Unlock()
+	select {
+	case sub.notify <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// dequeue removes the oldest chunk; ok is false when none is pending.
+func (sub *subscriber) dequeue() ([]byte, bool) {
+	sub.mu.Lock()
+	defer sub.mu.Unlock()
+	if len(sub.queue) == 0 {
+		return nil, false
+	}
+	data := sub.queue[0]
+	sub.queue[0] = nil
+	sub.queue = sub.queue[1:]
+	sub.queued -= len(data)
+	return data, true
 }
 
 func newSharedStream(g *Gateway, id string, key streamKey, serviceName string, cancel context.CancelFunc) *sharedStream {
@@ -162,13 +194,14 @@ func (g *Gateway) openSharedStream(w http.ResponseWriter, r *http.Request, key s
 	timeout := time.Duration(g.config.StreamTimeoutSeconds) * time.Second
 	warned := false
 	for {
-		select {
-		case <-r.Context().Done():
-			panic(http.ErrAbortHandler)
-		case <-sub.dropped:
-			panic(http.ErrAbortHandler)
-		case chunk, ok := <-sub.chunks:
-			if !ok {
+		chunk, ok := sub.dequeue()
+		if !ok {
+			select {
+			case <-r.Context().Done():
+				panic(http.ErrAbortHandler)
+			case <-sub.dropped:
+				panic(http.ErrAbortHandler)
+			case <-sub.done:
 				if status != 0 {
 					w.WriteHeader(status)
 				}
@@ -176,29 +209,30 @@ func (g *Gateway) openSharedStream(w http.ResponseWriter, r *http.Request, key s
 					panic(http.ErrAbortHandler)
 				}
 				return
+			case <-sub.notify:
 			}
-			sub.queued.Add(-int64(len(chunk)))
-			if err := controller.SetWriteDeadline(time.Now().Add(timeout)); err != nil && !warned {
-				warned = true
-				log.Printf("write deadline unsupported, slow clients are not bounded: %v", err)
-			}
-			if status != 0 {
-				w.WriteHeader(status)
-				status = 0
-			}
-			n, err := w.Write(chunk)
-			sub.bytes.Add(int64(n))
-			if live {
-				g.downstreamBytes.Add(int64(n))
-			}
-			if err != nil {
-				log.Printf("stream %s (%s): subscriber %s write failed: %v", shared.id, shared.key.label(), sub.id, err)
-				panic(http.ErrAbortHandler)
-			}
-			if err := controller.Flush(); err != nil {
-				log.Printf("stream %s (%s): subscriber %s flush failed: %v", shared.id, shared.key.label(), sub.id, err)
-				panic(http.ErrAbortHandler)
-			}
+			continue
+		}
+		if err := controller.SetWriteDeadline(time.Now().Add(timeout)); err != nil && !warned {
+			warned = true
+			log.Printf("write deadline unsupported, slow clients are not bounded: %v", err)
+		}
+		if status != 0 {
+			w.WriteHeader(status)
+			status = 0
+		}
+		n, err := w.Write(chunk)
+		sub.bytes.Add(int64(n))
+		if live {
+			g.downstreamBytes.Add(int64(n))
+		}
+		if err != nil {
+			log.Printf("stream %s (%s): subscriber %s write failed: %v", shared.id, shared.key.label(), sub.id, err)
+			panic(http.ErrAbortHandler)
+		}
+		if err := controller.Flush(); err != nil {
+			log.Printf("stream %s (%s): subscriber %s flush failed: %v", shared.id, shared.key.label(), sub.id, err)
+			panic(http.ErrAbortHandler)
 		}
 	}
 }
@@ -278,7 +312,7 @@ func (s *sharedStream) run(r *http.Request, sources []source, opts streamOptions
 			close(s.ready)
 		}
 		for sub := range s.subscribers {
-			close(sub.chunks)
+			close(sub.done)
 		}
 		if s.g.streams[s.key] == s {
 			delete(s.g.streams, s.key)
@@ -324,6 +358,9 @@ func (s *sharedStream) Write(p []byte) (int, error) {
 		dropped = append(dropped, sub)
 		close(sub.dropped)
 		delete(s.subscribers, sub)
+		sub.mu.Lock()
+		sub.queue, sub.queued = nil, 0
+		sub.mu.Unlock()
 	}
 	for sub := range s.subscribers {
 		data := chunk
@@ -335,16 +372,7 @@ func (s *sharedStream) Write(p []byte) (int, error) {
 				continue
 			}
 		}
-		if sub.queued.Add(int64(len(data))) > subscriberQueueBytes {
-			sub.queued.Add(-int64(len(data)))
-			drop(sub)
-			continue
-		}
-		select {
-		case sub.chunks <- data:
-		default:
-			// Chunk-count safety net for many tiny reads.
-			sub.queued.Add(-int64(len(data)))
+		if !sub.enqueue(data) {
 			drop(sub)
 		}
 	}
