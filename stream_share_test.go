@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,7 +118,7 @@ func TestSharedStreamLifecycleAndOptions(t *testing.T) {
 	}
 }
 
-func TestSharedFanoutSlowSubscriberAndAlignment(t *testing.T) {
+func TestSharedQueueLimitIsBytes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fast := newSubscriber()
@@ -125,19 +126,88 @@ func TestSharedFanoutSlowSubscriberAndAlignment(t *testing.T) {
 	s := newSharedStream(nil, "s", streamKey{}, "", cancel)
 	s.subscribers[fast] = true
 	s.subscribers[slow] = true
-	for i := 0; i < subscriberQueueSize+1; i++ {
-		if _, err := s.Write([]byte{byte(i)}); err != nil {
+	sent := 0
+	write := func(size int) {
+		t.Helper()
+		if _, err := s.Write(bytes.Repeat([]byte{0x47}, size)); err != nil {
 			t.Fatal(err)
 		}
-		<-fast.chunks
+		sent += size
+		got, state := fast.dequeue()
+		if state != subscriberChunk || len(got) != size {
+			t.Fatalf("fast subscriber got %d of the %d byte chunk (state %d)", len(got), size, state)
+		}
+		select {
+		case <-slow.dropped:
+			t.Fatalf("slow subscriber dropped at %d bytes queued, limit %d", sent, subscriberQueueBytes)
+		default:
+		}
+	}
+	// Mixed 8 KiB and 32 KiB reads: the limit counts bytes, not chunks.
+	for i := 0; ; i++ {
+		size := 32 << 10
+		if i%2 == 0 {
+			size = 8 << 10
+		}
+		if sent+size > subscriberQueueBytes {
+			break
+		}
+		write(size)
+	}
+	if sent < 8<<20 {
+		t.Fatalf("test only queued %d bytes", sent)
+	}
+	if sent < subscriberQueueBytes {
+		write(subscriberQueueBytes - sent)
+	}
+	// One byte over the limit drops only the slow subscriber.
+	if _, err := s.Write([]byte{0x47}); err != nil {
+		t.Fatal(err)
+	}
+	if _, state := fast.dequeue(); state != subscriberChunk {
+		t.Fatal("fast subscriber did not receive the overflowing chunk")
 	}
 	select {
 	case <-slow.dropped:
 	default:
-		t.Fatal("slow subscriber not disconnected")
+		t.Fatalf("slow subscriber not dropped above the %d byte limit", subscriberQueueBytes)
+	}
+	if data, state := slow.dequeue(); data != nil || state != subscriberDropped {
+		t.Fatalf("dropped subscriber still yields chunks: %d bytes, state %d", len(data), state)
 	}
 	if ctx.Err() != nil {
 		t.Fatal("slow subscriber canceled healthy stream")
+	}
+}
+
+func TestSharedFinishedStreamWritesQueuedTail(t *testing.T) {
+	g, _ := streamGateway(t, "http://127.0.0.1:1")
+	shared := newSharedStream(g, "s", streamKey{}, "", func() {})
+	sub := newSubscriber()
+	tail := []byte("queued before the end")
+	sub.enqueue(tail)
+	sub.finish() // the tail and the end of the stream are pending together
+	w := newRecordingWriter(nil)
+	req, _ := http.NewRequest("GET", "/", nil)
+	g.pumpDownstream(w, req, shared, sub, 503)
+	if got := w.contents(); !bytes.Equal(got, tail) {
+		t.Fatalf("queued tail not written: got %q", got)
+	}
+}
+
+func TestSharedLateJoinAlignment(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fast := newSubscriber()
+	s := newSharedStream(nil, "s", streamKey{}, "", cancel)
+	s.subscribers[fast] = true
+	for i := 0; i < 17; i++ {
+		if _, err := s.Write([]byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, state := fast.dequeue(); state != subscriberChunk {
+			t.Fatal("fast subscriber did not receive the chunk")
+		}
 	}
 	// Upstream first byte is packet-aligned; a join after 17 bytes skips 171 bytes.
 	late := newSubscriber()
@@ -146,9 +216,332 @@ func TestSharedFanoutSlowSubscriberAndAlignment(t *testing.T) {
 	data := make([]byte, 200)
 	data[171] = 0x47
 	s.Write(data)
-	got := <-late.chunks
-	if len(got) != 29 || got[0] != 0x47 {
+	got, state := late.dequeue()
+	if state != subscriberChunk || len(got) != 29 || got[0] != 0x47 {
 		t.Fatalf("late join alignment: %d bytes, first %x", len(got), got[0])
+	}
+}
+
+// recordingWriter records the response body. When release is non-nil, Write
+// blocks until it is closed, standing in for a subscriber that stalls; blocked
+// closes when the first Write reaches that point.
+type recordingWriter struct {
+	mu        sync.Mutex
+	header    http.Header
+	body      bytes.Buffer
+	firstLen  int // bytes in the first Write that was recorded
+	updated   chan struct{}
+	release   <-chan struct{}
+	blocked   chan struct{}
+	blockOnce sync.Once
+}
+
+func newRecordingWriter(release <-chan struct{}) *recordingWriter {
+	w := &recordingWriter{header: make(http.Header), updated: make(chan struct{}, 1), release: release}
+	if release != nil {
+		w.blocked = make(chan struct{})
+	}
+	return w
+}
+
+func (w *recordingWriter) Header() http.Header { return w.header }
+func (w *recordingWriter) WriteHeader(int)     {}
+func (w *recordingWriter) SetWriteDeadline(time.Time) error {
+	return nil
+}
+func (w *recordingWriter) FlushError() error { return nil }
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	if w.release != nil {
+		w.blockOnce.Do(func() { close(w.blocked) })
+		<-w.release
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.body.Write(p)
+	if w.firstLen == 0 {
+		w.firstLen = len(p)
+	}
+	select {
+	case w.updated <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+func (w *recordingWriter) size() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Len()
+}
+func (w *recordingWriter) firstWrite() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.firstLen
+}
+func (w *recordingWriter) contents() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.body.Bytes()...)
+}
+
+// streamGateway builds a gateway with one healthy backend and its sources.
+func streamGateway(t *testing.T, upstreamURL string) (*Gateway, []source) {
+	t.Helper()
+	g, err := NewGateway(Config{Listen: ":1", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 5, Backends: []BackendConfig{{ID: "a", URL: upstreamURL}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.backends[0].healthy = true
+	g.backends[0].updated = time.Now()
+	return g, []source{{backend: 0, service: object{"channel": map[string]any{"type": "GR"}}}}
+}
+
+// startSubscriber runs the real subscriber path in the background.
+func startSubscriber(g *Gateway, w http.ResponseWriter, sources []source, id int64) (cancel func(), done <-chan struct{}) {
+	ctx, ctxCancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		defer func() {
+			if p := recover(); p != nil && p != http.ErrAbortHandler {
+				panic(p)
+			}
+		}()
+		req, _ := http.NewRequestWithContext(ctx, "GET", "/", nil)
+		g.sharedStream(w, req, id, sources, streamOptions{})
+	}()
+	return ctxCancel, finished
+}
+
+func stopSubscriber(t *testing.T, cancel func(), done <-chan struct{}) {
+	t.Helper()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber did not stop")
+	}
+}
+
+func waitSubscribers(t *testing.T, g *Gateway, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		g.streamsMu.Lock()
+		count := 0
+		for _, s := range g.streams {
+			s.mu.Lock()
+			count += len(s.subscribers)
+			s.mu.Unlock()
+		}
+		g.streamsMu.Unlock()
+		if count == n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("did not reach %d subscribers", n)
+}
+
+func waitWrote(t *testing.T, w *recordingWriter, want int) {
+	t.Helper()
+	timeout := time.After(5 * time.Second)
+	for w.size() < want {
+		select {
+		case <-w.updated:
+		case <-timeout:
+			t.Fatalf("received %d of %d bytes", w.size(), want)
+		}
+	}
+}
+
+func TestSharedSubscriberStallResumesWithoutLoss(t *testing.T) {
+	data := make([]byte, 1<<20)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	first, rest := data[:64<<10], data[64<<10:]
+	more := make(chan struct{})
+	started := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "video/MP2T")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		if _, err := w.Write(first); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		select {
+		case <-more:
+		case <-r.Context().Done():
+			return
+		}
+		if _, err := w.Write(rest); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(upstream.Close)
+	g, sources := streamGateway(t, upstream.URL)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	fast := newRecordingWriter(nil)
+	fastCancel, fastDone := startSubscriber(g, fast, sources, 1000101)
+	t.Cleanup(func() { stopSubscriber(t, fastCancel, fastDone) })
+	waitSubscribers(t, g, 1)
+	slow := newRecordingWriter(release)
+	slowCancel, slowDone := startSubscriber(g, slow, sources, 1000101)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		stopSubscriber(t, slowCancel, slowDone)
+	})
+	waitSubscribers(t, g, 2)
+	close(started)
+
+	// The stalled subscriber blocks on its first write; only then is the rest
+	// of the stream sent, and the healthy subscriber receives all of it.
+	select {
+	case <-slow.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled subscriber never entered a write")
+	}
+	close(more)
+	waitWrote(t, fast, len(data))
+	if n := slow.size(); n != 0 {
+		t.Fatalf("stalled subscriber wrote %d bytes before resuming", n)
+	}
+	waitSubscribers(t, g, 2) // the stalled subscriber is still attached
+	releaseOnce.Do(func() { close(release) })
+	waitWrote(t, slow, len(data))
+	if got := fast.contents(); !bytes.Equal(got, data) {
+		t.Fatalf("healthy subscriber lost data: %d bytes", len(got))
+	}
+	if got := slow.contents(); !bytes.Equal(got, data) {
+		t.Fatalf("stalled subscriber lost data after resuming: %d bytes", len(got))
+	}
+}
+
+func TestSharedCancelledSubscriberStopsWritingQueuedChunks(t *testing.T) {
+	data := make([]byte, 4<<20)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	started := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "video/MP2T")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		if _, err := w.Write(data); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(upstream.Close)
+	g, sources := streamGateway(t, upstream.URL)
+	fast := newRecordingWriter(nil)
+	fastCancel, fastDone := startSubscriber(g, fast, sources, 1000101)
+	t.Cleanup(func() { stopSubscriber(t, fastCancel, fastDone) })
+	waitSubscribers(t, g, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	slow := newRecordingWriter(release)
+	slowCancel, slowDone := startSubscriber(g, slow, sources, 1000101)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		stopSubscriber(t, slowCancel, slowDone)
+	})
+	waitSubscribers(t, g, 2)
+	close(started)
+
+	select {
+	case <-slow.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled subscriber never entered a write")
+	}
+	waitWrote(t, fast, len(data))
+	if n := slow.size(); n != 0 {
+		t.Fatalf("stalled subscriber wrote %d bytes before resuming", n)
+	}
+	slowCancel()
+	releaseOnce.Do(func() { close(release) })
+	// Cancelling must abandon the queued chunks instead of writing them out.
+	select {
+	case <-slowDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled subscriber did not stop")
+	}
+	if got, want := slow.size(), slow.firstWrite(); got != want {
+		t.Fatalf("cancelled subscriber wrote %d bytes, expected only the %d byte chunk in flight", got, want)
+	}
+	if got := fast.contents(); !bytes.Equal(got, data) {
+		t.Fatalf("healthy subscriber lost data: %d bytes", len(got))
+	}
+}
+
+func TestSharedStreamEndKeepsTailChunk(t *testing.T) {
+	first := bytes.Repeat([]byte{0x47}, 188)
+	tail := bytes.Repeat([]byte{0x48}, 188)
+	next := make(chan chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/MP2T")
+		w.WriteHeader(200)
+		if _, err := w.Write(first); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		var sendTail chan struct{}
+		select {
+		case sendTail = <-next:
+		case <-r.Context().Done():
+			return
+		}
+		select {
+		case <-sendTail:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = w.Write(tail)
+		w.(http.Flusher).Flush()
+		// Return without another read: the tail and the end of the stream are
+		// ready at the same time.
+	}))
+	t.Cleanup(upstream.Close)
+	g, sources := streamGateway(t, upstream.URL)
+	want := append(append([]byte(nil), first...), tail...)
+	for i := 0; i < 20; i++ {
+		w := newRecordingWriter(nil)
+		cancel, done := startSubscriber(g, w, sources, 1000101)
+		t.Cleanup(cancel)
+		waitWrote(t, w, len(first))
+		sendTail := make(chan struct{})
+		select {
+		case next <- sendTail:
+		case <-done:
+			t.Fatal("subscriber ended before the tail was requested")
+		case <-time.After(5 * time.Second):
+			t.Fatal("upstream did not ask for the tail")
+		}
+		close(sendTail)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("subscriber did not finish")
+		}
+		cancel()
+		if got := w.contents(); !bytes.Equal(got, want) {
+			t.Fatalf("run %d: got %d of %d bytes", i, len(got), len(want))
+		}
 	}
 }
 
