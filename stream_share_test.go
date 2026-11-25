@@ -229,6 +229,7 @@ type recordingWriter struct {
 	mu        sync.Mutex
 	header    http.Header
 	body      bytes.Buffer
+	firstLen  int // bytes in the first Write that was recorded
 	updated   chan struct{}
 	release   <-chan struct{}
 	blocked   chan struct{}
@@ -257,6 +258,9 @@ func (w *recordingWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	n, err := w.body.Write(p)
+	if w.firstLen == 0 {
+		w.firstLen = len(p)
+	}
 	select {
 	case w.updated <- struct{}{}:
 	default:
@@ -267,6 +271,11 @@ func (w *recordingWriter) size() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.body.Len()
+}
+func (w *recordingWriter) firstWrite() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.firstLen
 }
 func (w *recordingWriter) contents() []byte {
 	w.mu.Lock()
@@ -472,8 +481,8 @@ func TestSharedCancelledSubscriberStopsWritingQueuedChunks(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancelled subscriber did not stop")
 	}
-	if n := slow.size(); n >= len(data) {
-		t.Fatalf("cancelled subscriber wrote %d of %d queued bytes", n, len(data))
+	if got, want := slow.size(), slow.firstWrite(); got != want {
+		t.Fatalf("cancelled subscriber wrote %d bytes, expected only the %d byte chunk in flight", got, want)
 	}
 	if got := fast.contents(); !bytes.Equal(got, data) {
 		t.Fatalf("healthy subscriber lost data: %d bytes", len(got))
@@ -516,7 +525,13 @@ func TestSharedStreamEndKeepsTailChunk(t *testing.T) {
 		t.Cleanup(cancel)
 		waitWrote(t, w, len(first))
 		sendTail := make(chan struct{})
-		next <- sendTail
+		select {
+		case next <- sendTail:
+		case <-done:
+			t.Fatal("subscriber ended before the tail was requested")
+		case <-time.After(5 * time.Second):
+			t.Fatal("upstream did not ask for the tail")
+		}
 		close(sendTail)
 		select {
 		case <-done:
