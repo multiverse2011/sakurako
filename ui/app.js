@@ -22,8 +22,12 @@ function node(title, subtitle, badge){const box=el('div',undefined,'node');const
 function backendLink(b){const a=el('a',b.id+' ↗','backend-link');a.href=b.ui_url;a.target='_blank';a.rel='noopener noreferrer';a.title=`Open ${b.id} Mirakurun UI (new tab)`;a.setAttribute('aria-label',a.title);return a;}
 const tunerFor = id => tuners?.backends.find(b => b.id === id);
 const tunerLabel = c => `${c.in_use} / ${c.total}${c.fault ? ` · ${c.fault} fault` : ''}`;
-function tunerCell(c){const td=el('td',c?tunerLabel(c):'—');if(!c)return td;if(c.fault)td.classList.add('tuner-fault');else td.append(el('div',`${c.free} free`,'subtitle'));return td;}
-function renderTuners(){if(!tuners){$('tuner-count').textContent='—';$('tuner-summary').textContent='Loading…';return;}$('tuner-count').textContent=tuners.available?`${tuners.in_use} / ${tuners.total}`:'—';$('tuner-summary').textContent=tuners.available?`${tuners.free} free${tuners.fault?` · ${tuners.fault} fault`:''}`:'Tuner information unavailable';$('tuner-summary').classList.toggle('tuner-fault',Boolean(tuners.fault));}
+// Who holds the in-use tuners: Sakurako's own streams, the backend's EPG, or other clients.
+const tunerUsage = c => {const b=c.in_use_by;if(!c.in_use||!b)return '';const parts=[`${b.sakurako||0} by Sakurako`],backend=(b.epg||0)+(b.backend||0);if(b.epg&&!b.backend)parts.push(`${b.epg} by backend: EPG`);else if(backend)parts.push(`${backend} by backend`);if(b.other)parts.push(`${b.other} by other clients`);return parts.join(' · ');};
+const tunerTypes = c => (c.free_by_type||[]).map(t=>`${t.type} ${t.free} free`).join(' · ');
+const tunerTypeTitle = c => {const types=tunerTypes(c);return types?`Free by tuner type: ${types}. A tuner supporting several types counts as free for each of them.`:'';};
+function tunerCell(c){const td=el('td',c?tunerLabel(c):'—');if(!c)return td;if(c.fault)td.classList.add('tuner-fault');else td.append(el('div',`${c.free} free`,'subtitle'));const title=[tunerUsage(c),tunerTypeTitle(c)].filter(Boolean).join(' · ');if(title)td.title=title;return td;}
+function renderTuners(){if(!tuners){$('tuner-count').textContent='—';$('tuner-summary').textContent='Loading…';return;}$('tuner-count').textContent=tuners.available?`${tuners.in_use} / ${tuners.total}`:'—';$('tuner-summary').textContent=tuners.available?[`${tuners.free} free`,tunerUsage(tuners),tuners.fault?`${tuners.fault} fault`:''].filter(Boolean).join(' · '):'Tuner information unavailable';$('tuner-summary').title=tuners.available?tunerTypeTitle(tuners):'';$('tuner-summary').classList.toggle('tuner-fault',Boolean(tuners.fault));}
 function detail(title,text){$('detail-title').textContent=title;$('detail-body').textContent=text;$('detail').showModal();}
 function renderServices(){
  if(!state)return;

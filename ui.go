@@ -310,35 +310,132 @@ func (g *Gateway) tunerCounts(ctx context.Context) object {
 		return nil
 	}
 	backends := []object{}
-	inUse, total, free, fault := 0, 0, 0, 0
+	all := tunerCount{byHolder: map[string]int{}, freeByType: map[string]int{}}
 	for i, list := range lists {
 		if errs[i] != nil {
 			continue
 		}
-		used, all, idle, broken := countTuners(list)
-		inUse, total, free, fault = inUse+used, total+all, free+idle, fault+broken
-		backends = append(backends, object{"id": ids[i], "in_use": used, "total": all, "free": idle, "fault": broken})
+		c := countTuners(list)
+		all.add(c)
+		row := c.object()
+		row["id"] = ids[i]
+		backends = append(backends, row)
 	}
-	return object{"available": len(backends) > 0, "in_use": inUse, "total": total, "free": free, "fault": fault, "backends": backends}
+	out := all.object()
+	out["available"] = len(backends) > 0
+	out["backends"] = backends
+	return out
+}
+
+// tunerCount summarizes a backend's tuners. byHolder splits the in-use tuners by
+// who holds them, so a backend using its own tuners for EPG does not look like
+// an unexplained allocation. freeByType counts free tuners per supported type;
+// a combined tuner is free for each of its types.
+type tunerCount struct {
+	inUse, total, free, fault int
+	byHolder                  map[string]int
+	freeByType                map[string]int
 }
 
 // countTuners splits a backend's tuners into in use, free and faulty, so a faulty
 // tuner is never counted as an allocation or as something that can be allocated.
 // isUsing is checked as well as users because not every Mirakurun reports both.
-func countTuners(list []object) (inUse, total, free, fault int) {
+func countTuners(list []object) tunerCount {
+	c := tunerCount{byHolder: map[string]int{}, freeByType: map[string]int{}}
 	for _, t := range list {
-		total++
+		c.total++
 		users, _ := t["users"].([]any)
+		types, _ := t["types"].([]any)
+		for _, typ := range types {
+			if name, ok := typ.(string); ok {
+				if _, seen := c.freeByType[name]; !seen {
+					c.freeByType[name] = 0 // keep a type visible when none of it is free
+				}
+			}
+		}
 		switch {
 		case t["isFault"] == true:
-			fault++
+			c.fault++
 		case t["isUsing"] == true || len(users) > 0:
-			inUse++
+			c.inUse++
+			c.byHolder[tunerHolder(users)]++
 		default:
-			free++
+			c.free++
+			for _, typ := range types {
+				if name, ok := typ.(string); ok {
+					c.freeByType[name]++
+				}
+			}
 		}
 	}
-	return inUse, total, free, fault
+	return c
+}
+
+// tunerHolder names who holds an in-use tuner. Mirakurun records a stream's
+// User-Agent as the user's agent, and sakurako always sends "Sakurako", so its
+// own allocations are recognised without matching the id, which is IP:port.
+// An id prefixed "Mirakurun:" is the backend itself (EPG or another internal job).
+func tunerHolder(users []any) string {
+	kind := "other"
+	for _, u := range users {
+		user, _ := u.(map[string]any)
+		id, _ := user["id"].(string)
+		switch {
+		case user["agent"] == "Sakurako":
+			return "sakurako" // a tuner shared with sakurako is counted once, as sakurako's
+		case id == "Mirakurun:getEPG()":
+			kind = "epg"
+		case strings.HasPrefix(id, "Mirakurun:") && kind != "epg":
+			kind = "backend"
+		}
+	}
+	return kind
+}
+
+func (c *tunerCount) add(o tunerCount) {
+	c.inUse, c.total, c.free, c.fault = c.inUse+o.inUse, c.total+o.total, c.free+o.free, c.fault+o.fault
+	for k, n := range o.byHolder {
+		c.byHolder[k] += n
+	}
+	for k, n := range o.freeByType {
+		if _, seen := c.freeByType[k]; !seen {
+			c.freeByType[k] = 0
+		}
+		c.freeByType[k] += n
+	}
+}
+
+// object renders the counts in the shape /-/ui/tuners returns.
+func (c tunerCount) object() object {
+	return object{
+		"in_use": c.inUse, "total": c.total, "free": c.free, "fault": c.fault,
+		"in_use_by": object{
+			"sakurako": c.byHolder["sakurako"], "epg": c.byHolder["epg"],
+			"backend": c.byHolder["backend"], "other": c.byHolder["other"],
+		},
+		"free_by_type": freeByTypeList(c.freeByType),
+	}
+}
+
+// freeByTypeList keeps broadcast types in their usual order and sorts the rest.
+func freeByTypeList(counts map[string]int) []object {
+	out, seen := []object{}, map[string]bool{}
+	for _, typ := range []string{"GR", "BS", "CS"} {
+		if n, ok := counts[typ]; ok {
+			out, seen[typ] = append(out, object{"type": typ, "free": n}), true
+		}
+	}
+	rest := []string{}
+	for typ := range counts {
+		if !seen[typ] {
+			rest = append(rest, typ)
+		}
+	}
+	sort.Strings(rest)
+	for _, typ := range rest {
+		out = append(out, object{"type": typ, "free": counts[typ]})
+	}
+	return out
 }
 
 // mirakurunUIURL preserves reverse-proxy prefixes while removing the Mirakurun API suffix.

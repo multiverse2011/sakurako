@@ -187,9 +187,97 @@ func TestUITunerCountsSkipsDisconnectedClient(t *testing.T) {
 
 func TestCountTunersIsUsing(t *testing.T) {
 	// Mirakurun may report allocation only through isUsing.
-	inUse, total, free, fault := countTuners([]object{{"isUsing": true}, {"isAvailable": true}, {"isFault": true}})
-	if inUse != 1 || total != 3 || free != 1 || fault != 1 {
-		t.Fatalf("countTuners: %d %d %d %d", inUse, total, free, fault)
+	c := countTuners([]object{{"isUsing": true}, {"isAvailable": true}, {"isFault": true}})
+	if c.inUse != 1 || c.total != 3 || c.free != 1 || c.fault != 1 {
+		t.Fatalf("countTuners: %+v", c)
+	}
+	// Without users there is no way to tell who holds it, so it is not Sakurako's.
+	if c.byHolder["other"] != 1 {
+		t.Fatalf("isUsing without users: %+v", c.byHolder)
+	}
+}
+
+func TestCountTunersUsageBreakdown(t *testing.T) {
+	list := []object{
+		{"types": []any{"GR"}, "users": []any{map[string]any{"id": "10.0.0.2:5000", "agent": "Sakurako"}}},
+		{"types": []any{"GR"}, "users": []any{map[string]any{"id": "Mirakurun:getEPG()", "priority": -1}}},
+		{"types": []any{"BS"}, "users": []any{map[string]any{"id": "Mirakurun:getServices()"}}},
+		{"types": []any{"BS", "CS", "SKY"}, "users": []any{map[string]any{"id": "10.0.0.9:6000", "agent": "tvheadend"}}},
+		// A tuner shared by the backend and Sakurako is counted once, as Sakurako's.
+		{"types": []any{"GR"}, "users": []any{map[string]any{"id": "Mirakurun:getEPG()"}, map[string]any{"id": "10.0.0.3:7000", "agent": "Sakurako"}}},
+		{"types": []any{"GR", "BS"}, "isAvailable": true},
+		{"types": []any{"CS"}, "isAvailable": true},
+	}
+	c := countTuners(list)
+	if c.inUse != 5 || c.total != 7 || c.free != 2 || c.fault != 0 {
+		t.Fatalf("counts: %+v", c)
+	}
+	for kind, want := range map[string]int{"sakurako": 2, "epg": 1, "backend": 1, "other": 1} {
+		if c.byHolder[kind] != want {
+			t.Errorf("by %s: got %d, want %d", kind, c.byHolder[kind], want)
+		}
+	}
+	// A free combined tuner is free for each of its types; a type with no free
+	// tuner still shows up as zero instead of disappearing.
+	for typ, want := range map[string]int{"GR": 1, "BS": 1, "CS": 1, "SKY": 0} {
+		if got := c.freeByType[typ]; got != want {
+			t.Errorf("%s free: got %d, want %d", typ, got, want)
+		}
+	}
+}
+
+func TestUITunerCountsUsageBreakdown(t *testing.T) {
+	a := newFake(t, 10, "primary")
+	a.tuners = []object{
+		{"types": []any{"GR"}, "users": []object{{"id": "Mirakurun:getEPG()", "priority": -1}}},
+		{"types": []any{"GR", "BS"}, "isAvailable": true},
+	}
+	_, s := gateway(t, a)
+	type typeFree struct {
+		Type string `json:"type"`
+		Free int    `json:"free"`
+	}
+	var got struct {
+		InUse      int            `json:"in_use"`
+		InUseBy    map[string]int `json:"in_use_by"`
+		FreeByType []typeFree     `json:"free_by_type"`
+		Backends   []struct {
+			ID         string         `json:"id"`
+			InUseBy    map[string]int `json:"in_use_by"`
+			FreeByType []typeFree     `json:"free_by_type"`
+		} `json:"backends"`
+	}
+	getJSON(t, s.URL+"/-/ui/tuners", 200, &got)
+	if got.InUse != 1 || got.InUseBy["epg"] != 1 || got.InUseBy["sakurako"] != 0 {
+		t.Fatalf("aggregate usage: %+v", got)
+	}
+	for _, row := range []struct {
+		name  string
+		types []typeFree
+	}{{"aggregate", got.FreeByType}, {"backend", got.Backends[0].FreeByType}} {
+		if len(row.types) != 2 || row.types[0] != (typeFree{"GR", 1}) || row.types[1] != (typeFree{"BS", 1}) {
+			t.Fatalf("%s free by type: %+v", row.name, row.types)
+		}
+	}
+	if got.Backends[0].ID != "region0" || got.Backends[0].InUseBy["epg"] != 1 {
+		t.Fatalf("backend usage: %+v", got.Backends)
+	}
+}
+
+// No JS runner here, so pin the labels and the fields the screen reads.
+func TestUITunerUsageMarkup(t *testing.T) {
+	g, _ := gateway(t, newFake(t, 10, "service"))
+	for path, needles := range map[string][]string{
+		"/ui/":       {"Tuners (in use / total)"},
+		"/ui/app.js": {"in_use_by", "free_by_type", "by Sakurako", "by backend: EPG"},
+	} {
+		r := httptest.NewRecorder()
+		g.ServeHTTP(r, httptest.NewRequest("GET", path, nil))
+		for _, needle := range needles {
+			if !strings.Contains(r.Body.String(), needle) {
+				t.Errorf("%s: missing %s", path, needle)
+			}
+		}
 	}
 }
 
