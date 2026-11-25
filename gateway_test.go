@@ -59,6 +59,7 @@ type fakeBackend struct {
 	started            chan http.Header
 	canceled           chan struct{}
 	stall              bool
+	hold               chan struct{} // returns after headers once closed (or on timeout)
 	end                bool
 	oneChunk           bool
 	continuous         bool
@@ -88,7 +89,7 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 		f.mu.Lock()
 		down, status, stall, end := f.down, f.streamStatus, f.stall, f.end
 		oneChunk, reset := f.oneChunk, f.resetAfterChunk
-		continuous := f.continuous
+		continuous, hold := f.continuous, f.hold
 		failServices, failPrograms, failTuners := f.failServices, f.failPrograms, f.failTuners
 		stallTuners := f.stallTuners
 		failEvents := f.failEvents
@@ -212,6 +213,14 @@ func newFake(t *testing.T, n int64, name string) *fakeBackend {
 			w.Header().Set("X-Mirakurun-Tuner-User-ID", "fake-user")
 			w.WriteHeader(200)
 			w.(http.Flusher).Flush()
+			if hold != nil {
+				// The test decides when this attempt fails without sending data.
+				select {
+				case <-hold:
+				case <-r.Context().Done():
+				}
+				return
+			}
 			payload := []byte("transport-stream")
 			if oneChunk {
 				payload = chunk188

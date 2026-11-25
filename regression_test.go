@@ -204,11 +204,11 @@ func breakStream(t *testing.T, g *Gateway, url string) time.Time {
 }
 
 // A stalled test process must not let the cooldown expire unnoticed, which would
-// make a passing request indistinguishable from a rescue.
-func withinCooldown(t *testing.T, until time.Time) {
+// let the normal path pass instead of the cooling fallback.
+func withinCooldown(t *testing.T, until time.Time, stage string) {
 	t.Helper()
 	if !time.Now().Before(until) {
-		t.Fatal("cooldown expired before the request; the rescue was not exercised")
+		t.Fatalf("cooldown expired %s; the test can no longer prove the cooldown was in effect", stage)
 	}
 }
 
@@ -225,23 +225,25 @@ func TestSoleSourceRetriedDuringCooldown(t *testing.T) {
 	a.resetAfterChunk = false
 	a.mu.Unlock()
 
-	withinCooldown(t, until)
+	withinCooldown(t, until, "before the HEAD request")
 	req, _ := http.NewRequest("HEAD", streamURL(s.URL, 1000101), nil)
 	head, err := testClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	head.Body.Close()
+	withinCooldown(t, until, "after the HEAD response headers")
 	if head.StatusCode != 200 {
 		t.Fatalf("HEAD on the cooling sole source: HTTP %d", head.StatusCode)
 	}
 
-	withinCooldown(t, until)
+	withinCooldown(t, until, "before the GET request")
 	resp, err := testClient.Get(streamURL(s.URL, 1000101))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	withinCooldown(t, until, "after the GET response headers")
 	if resp.StatusCode != 200 {
 		t.Fatalf("recovered sole source: HTTP %d", resp.StatusCode)
 	}
@@ -266,13 +268,14 @@ func TestSoleChannelSourceRetriedDuringCooldown(t *testing.T) {
 	a.mu.Unlock()
 
 	calls := a.streamCalls.Load()
-	withinCooldown(t, until)
+	withinCooldown(t, until, "before the HEAD request")
 	req, _ := http.NewRequest("HEAD", url, nil)
 	head, err := testClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	head.Body.Close()
+	withinCooldown(t, until, "after the HEAD response headers")
 	if head.StatusCode != 200 {
 		t.Fatalf("HEAD on the cooling sole channel: HTTP %d", head.StatusCode)
 	}
@@ -280,12 +283,13 @@ func TestSoleChannelSourceRetriedDuringCooldown(t *testing.T) {
 		t.Fatalf("HEAD opened %d upstream connections", got-calls)
 	}
 
-	withinCooldown(t, until)
+	withinCooldown(t, until, "before the GET request")
 	resp, err := testClient.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	withinCooldown(t, until, "after the GET response headers")
 	if resp.StatusCode != 200 {
 		t.Fatalf("recovered sole channel source: HTTP %d", resp.StatusCode)
 	}
@@ -310,12 +314,13 @@ func TestSoleSourceRescueFailureReturns503(t *testing.T) {
 	a.mu.Unlock()
 
 	calls := a.streamCalls.Load()
-	withinCooldown(t, until)
+	withinCooldown(t, until, "before the GET request")
 	resp, err := testClient.Get(streamURL(s.URL, 1000101))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	withinCooldown(t, until, "after the GET response headers")
 	if resp.StatusCode != 503 {
 		t.Fatalf("unrecovered sole source: HTTP %d, want 503", resp.StatusCode)
 	}
@@ -331,12 +336,17 @@ func TestCoolingSourceIsNotTriedWhileAnotherIsUsable(t *testing.T) {
 	b.streamStatus = 503
 	g, s := gateway(t, a, b)
 	g.block(0, 1000101, false, "test")
+	g.mu.RLock()
+	until := g.backends[0].blockedUntil
+	g.mu.RUnlock()
 
+	withinCooldown(t, until, "before the GET request")
 	resp, err := testClient.Get(streamURL(s.URL, 1000101))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	withinCooldown(t, until, "after the GET response headers")
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != 503 {
 		t.Fatalf("HTTP %d, want 503", resp.StatusCode)
@@ -353,7 +363,7 @@ func TestCoolingSourceIsNotTriedWhileAnotherIsUsable(t *testing.T) {
 // source must be skipped; the next usable source serves instead.
 func TestCandidateCooledMidRequestIsSkipped(t *testing.T) {
 	a, b, c := newFake(t, 10, "A"), newFake(t, 10, "B"), newFake(t, 10, "C")
-	a.stall = true // holds A until the first-byte timeout, without a test sleep
+	a.hold = make(chan struct{})
 	g, s := gateway(t, a, b, c)
 
 	type result struct {
@@ -374,14 +384,20 @@ func TestCandidateCooledMidRequestIsSkipped(t *testing.T) {
 		done <- result{status: resp.StatusCode, body: string(buf), err: err}
 	}()
 
-	// A is being tried; cool B down before the request reaches it.
+	// A has been tried and now waits on its hold channel; cool B down before
+	// letting A fail, so no upstream timeout decides the order.
 	waitStarted(t, a)
 	g.block(1, 1000101, false, "test")
+	g.mu.RLock()
+	until := g.backends[1].blockedUntil
+	g.mu.RUnlock()
+	close(a.hold)
 
 	got := <-done
 	if got.err != nil {
 		t.Fatal(got.err)
 	}
+	withinCooldown(t, until, "after the GET response headers")
 	if got.status != 200 || got.body != "transport-stream" {
 		t.Fatalf("HTTP %d body %q", got.status, got.body)
 	}
@@ -391,7 +407,6 @@ func TestCandidateCooledMidRequestIsSkipped(t *testing.T) {
 	if c.streamCalls.Load() != 1 {
 		t.Fatalf("third source calls = %d, want 1", c.streamCalls.Load())
 	}
-	waitCancel(t, a)
 	waitCancel(t, c)
 }
 

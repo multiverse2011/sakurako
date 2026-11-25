@@ -464,8 +464,8 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 		}
 		// A normal candidate may have been cooled down by another stream while an
 		// earlier source was being tried. A rescue candidate is cooling by design.
-		now := time.Now()
 		g.mu.RLock()
+		now := time.Now()
 		ok := g.catalogHealthy(s.backend, now)
 		if !rescue {
 			ok = ok && g.keyAvailable(s.backend, w.key, now)

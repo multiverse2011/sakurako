@@ -195,6 +195,7 @@ func TestCooldownScopeAndHEAD(t *testing.T) {
 	g, s := gateway(t, newFake(t, 10, "x"))
 	g.block(0, 1000101, true, "test")
 	g.mu.RLock()
+	until := g.backends[0].blockedServices[1000101]
 	svcBlocked, otherOK := !g.usable(0, streamKey{id: 1000101}, time.Now()), g.usable(0, streamKey{id: 42}, time.Now())
 	g.mu.RUnlock()
 	if !svcBlocked || !otherOK {
@@ -202,12 +203,14 @@ func TestCooldownScopeAndHEAD(t *testing.T) {
 	}
 	// A cooling source is still an attempt candidate when nothing else can serve,
 	// so HEAD and GET agree.
+	withinCooldown(t, until, "before the HEAD request")
 	req, _ := http.NewRequest("HEAD", s.URL+"/api/services/1000101/stream", nil)
 	resp, err := testClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	withinCooldown(t, until, "after the HEAD response headers")
 	if resp.StatusCode != 200 {
 		t.Fatalf("HEAD disagreed with the attempt decision: %d", resp.StatusCode)
 	}
@@ -219,7 +222,7 @@ func TestCooldownScopeAndHEAD(t *testing.T) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != 503 {
-		t.Fatalf("HEAD claimed playable while unhealthy: %d", resp.StatusCode)
+		t.Fatalf("HEAD claimed a candidate while unhealthy: %d", resp.StatusCode)
 	}
 }
 
