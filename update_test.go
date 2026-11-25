@@ -57,7 +57,7 @@ func TestUpdateCheckOffersNewerStableRelease(t *testing.T) {
 			if update["version"] != "v0.5.0" || update["url"] != "https://example.test/releases/v0.5.0" {
 				t.Fatalf("update: %v", update)
 			}
-			if got := g.uiState(time.Now())["update"].(object); got == nil {
+			if got, ok := g.uiState(time.Now())["update"].(object); !ok || got == nil {
 				t.Fatal("state has no update")
 			}
 			var wire struct {
@@ -281,6 +281,12 @@ func TestUpdateCheckDisabledSkipsGitHub(t *testing.T) {
 	}
 	if wire["update"] != nil {
 		t.Fatalf("update: %v, want null", wire["update"])
+	}
+}
+
+func TestUpdateCheckIntervalIsSixHours(t *testing.T) {
+	if updateCheckInterval != 6*time.Hour {
+		t.Fatalf("updateCheckInterval: %v, want 6h", updateCheckInterval)
 	}
 }
 

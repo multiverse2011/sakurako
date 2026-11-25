@@ -119,8 +119,9 @@ func fetchLatestRelease(ctx context.Context) (object, error) {
 	return object{"version": release.TagName, "url": release.HTMLURL}, nil
 }
 
-// newerVersion compares numeric cores only; callers exclude prerelease and
-// draft candidates themselves.
+// newerVersion compares release cores; an equal core counts as newer only when
+// the running build is a prerelease. Callers exclude prerelease and draft
+// candidates themselves.
 // shortcut: prerelease and build metadata are ignored, so the same core counts as
 // newer only when the running build is a prerelease. Move to a SemVer
 // implementation when tag-side prerelease ordering is needed.
