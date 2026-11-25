@@ -22,6 +22,9 @@ func TestUIStateUsesActualFallbackSource(t *testing.T) {
 	response := openStream(t, server.URL)
 	defer response.Body.Close()
 	snapshot := g.uiState(time.Now())
+	if snapshot["version"] != version {
+		t.Fatalf("state version: %v, want %v", snapshot["version"], version)
+	}
 	groups := snapshot["streams"].([]object)
 	if len(groups) != 1 {
 		t.Fatalf("groups: %v", groups)
@@ -49,6 +52,9 @@ func TestUIStateUsesActualFallbackSource(t *testing.T) {
 	getJSON(t, server.URL+"/-/ui/state", 200, &wire)
 	if len(wire["streams"].([]any)) != 1 {
 		t.Fatal("state route missing shared group")
+	}
+	if wire["version"] != version {
+		t.Fatalf("wire version: %v, want %v", wire["version"], version)
 	}
 }
 
