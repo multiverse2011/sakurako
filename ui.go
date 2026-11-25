@@ -345,13 +345,9 @@ func countTuners(list []object) tunerCount {
 	for _, t := range list {
 		c.total++
 		users, _ := t["users"].([]any)
-		types, _ := t["types"].([]any)
-		for _, typ := range types {
-			if name, ok := typ.(string); ok {
-				if _, seen := c.freeByType[name]; !seen {
-					c.freeByType[name] = 0 // keep a type visible when none of it is free
-				}
-			}
+		types := tunerTypes(t)
+		for _, name := range types {
+			c.freeByType[name] += 0 // register, so a type with no free tuner still shows
 		}
 		switch {
 		case t["isFault"] == true:
@@ -359,16 +355,37 @@ func countTuners(list []object) tunerCount {
 		case t["isUsing"] == true || len(users) > 0:
 			c.inUse++
 			c.byHolder[tunerHolder(users)]++
+		case t["isAvailable"] == false || t["isFree"] == false:
+			// Reported false: the tuner exists but cannot be allocated, so it is
+			// neither in use, free nor faulty. Upstreams omitting these keep the old rule.
 		default:
 			c.free++
-			for _, typ := range types {
-				if name, ok := typ.(string); ok {
-					c.freeByType[name]++
-				}
+			for _, name := range types {
+				c.freeByType[name]++
 			}
 		}
 	}
 	return c
+}
+
+// tunerTypes lists a tuner's types without duplicates; an upstream may repeat one.
+func tunerTypes(t object) []string {
+	raw, _ := t["types"].([]any)
+	types := make([]string, 0, len(raw))
+	for _, typ := range raw {
+		name, ok := typ.(string)
+		if !ok {
+			continue
+		}
+		dup := false
+		for _, have := range types {
+			dup = dup || have == name
+		}
+		if !dup {
+			types = append(types, name)
+		}
+	}
+	return types
 }
 
 // tunerHolder names who holds an in-use tuner. Mirakurun records a stream's

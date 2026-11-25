@@ -290,7 +290,7 @@
               "free":
                 "type": "integer"
               "free_by_type":
-                "description": "Free tuners per type; a tuner supporting several types is free for each of them."
+                "description": "Free tuners per type; a tuner supporting several types is free for each of them, and a type with no free tuner still appears with zero."
                 "items":
                   "additionalProperties": true
                   "properties":
@@ -306,18 +306,19 @@
                 "type": "integer"
               "in_use_by":
                 "additionalProperties": true
-                "description": "In-use tuners by holder. A tuner shared by several holders is counted once, sakurako first."
+                "description": "In-use tuners by holder. A tuner shared by several holders is counted once, in this order: sakurako, epg, backend, other. Sakurako is recognised approximately by the User-Agent it sends upstream, so another client or Sakurako instance sending the same value is counted as sakurako too."
                 "properties":
                   "backend":
-                    "description": "Other use by the backend itself."
+                    "description": "Other internal use by the backend itself, such as Mirakurun:getServices()."
                     "type": "integer"
                   "epg":
                     "description": "The backend's own EPG update (Mirakurun:getEPG())."
                     "type": "integer"
                   "other":
-                    "description": "Clients that do not go through Sakurako."
+                    "description": "External clients that do not go through Sakurako, or usage that cannot be identified."
                     "type": "integer"
                   "sakurako":
+                    "description": "Tuners held by Sakurako's own streams."
                     "type": "integer"
                 "type": "object"
               "total":
@@ -328,10 +329,10 @@
           "description": "Tuners reporting isFault; they are counted neither as in use nor as free."
           "type": "integer"
         "free":
-          "description": "Neither in use nor faulty."
+          "description": "Neither in use nor faulty; a tuner reporting isAvailable or isFree as false is not free either."
           "type": "integer"
         "free_by_type":
-          "description": "Free tuners per type; a tuner supporting several types is free for each of them."
+          "description": "Free tuners per type; a tuner supporting several types is free for each of them, and a type with no free tuner still appears with zero."
           "items":
             "additionalProperties": true
             "properties":
@@ -345,18 +346,19 @@
           "type": "integer"
         "in_use_by":
           "additionalProperties": true
-          "description": "In-use tuners by holder. A tuner shared by several holders is counted once, sakurako first."
+          "description": "In-use tuners by holder. A tuner shared by several holders is counted once, in this order: sakurako, epg, backend, other. Sakurako is recognised approximately by the User-Agent it sends upstream, so another client or Sakurako instance sending the same value is counted as sakurako too."
           "properties":
             "backend":
-              "description": "Other use by the backend itself."
+              "description": "Other internal use by the backend itself, such as Mirakurun:getServices()."
               "type": "integer"
             "epg":
               "description": "The backend's own EPG update (Mirakurun:getEPG())."
               "type": "integer"
             "other":
-              "description": "Clients that do not go through Sakurako."
+              "description": "External clients that do not go through Sakurako, or usage that cannot be identified."
               "type": "integer"
             "sakurako":
+              "description": "Tuners held by Sakurako's own streams."
               "type": "integer"
           "type": "object"
         "total":
