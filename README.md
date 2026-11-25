@@ -80,6 +80,21 @@ docker compose up -d
 - BS/CS では `networkId` が多くの放送で共通なので、別の放送を指していてもこの仕組みでは検出できません。実質的には GR 向けの保護です。
 - sakurako の起動直後、優先度が最も高い接続先からまだ一度もサービス情報を取得できていない場合は、競合を検出できません。
 
+## 環境変数
+
+| 変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `SAKURAKO_UPDATE_CHECK` | `true` | `false` で GitHub Releases へのアップデート確認を無効にする |
+
+アップデート確認は起動時に 1 回、その後 6 時間ごとに GitHub Releases の最新安定版を確認し、稼働中のバージョンより新しいときだけ管理画面のロゴ横に `Update available (v0.5.0)` のリンクを表示します。比較できない `dev` ビルドでは表示しません。`false` にすると GitHub へは問い合わせませんが、稼働中のバージョンは表示されます。Docker Compose では `environment:` で渡せます。
+
+```yaml
+services:
+  sakurako:
+    environment:
+      - SAKURAKO_UPDATE_CHECK=false
+```
+
 ## 仕組み
 
 - **情報の集約**：各 Mirakurun のサービス・番組情報を定期的に取得します。チャンネル名は `tokyo-3237` のように接続先ごとに区別します。
