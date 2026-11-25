@@ -4,13 +4,68 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// logCapture is a log destination safe to read while stream goroutines write.
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+func (c *logCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
+func captureLog(t *testing.T) *logCapture {
+	t.Helper()
+	c := &logCapture{}
+	old := log.Writer()
+	log.SetOutput(c)
+	t.Cleanup(func() { log.SetOutput(old) })
+	return c
+}
+
+// waitLog returns the captured output once want has been logged. The line can be
+// written by a stream goroutine, so poll instead of reading once.
+func waitLog(t *testing.T, c *logCapture, want string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := c.String()
+		if strings.Contains(got, want) {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("log line %q not found in:\n%s", want, got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func requireNotLogged(t *testing.T, got string, unwanted ...string) {
+	t.Helper()
+	for _, s := range unwanted {
+		if strings.Contains(got, s) {
+			t.Fatalf("unexpected log line %q in:\n%s", s, got)
+		}
+	}
+}
 
 func TestSharedStreamLifecycleAndOptions(t *testing.T) {
 	var calls, active atomic.Int32
@@ -591,5 +646,103 @@ func TestDecodeUnsetIsSeparateGroup(t *testing.T) {
 	}
 	if calls := a.streamCalls.Load(); calls != 2 {
 		t.Fatalf("upstream /stream calls %d", calls)
+	}
+}
+
+func TestStreamEndLogsNormalClose(t *testing.T) {
+	logs := captureLog(t)
+	a := newFake(t, 10, "A")
+	a.mu.Lock()
+	a.continuous = true
+	a.mu.Unlock()
+	_, s := gateway(t, a)
+
+	resp, err := testClient.Get(streamURL(s.URL, 1000101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(resp.Body, make([]byte, 188)); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	waitCancel(t, a)
+
+	got := waitLog(t, logs, "via region0: ended after")
+	requireNotLogged(t, got, "client disconnected", "context canceled")
+	if !strings.Contains(got, ", 188 B") {
+		t.Fatalf("summary lacks the transferred size:\n%s", got)
+	}
+}
+
+func TestStreamEndLogsSlowDrop(t *testing.T) {
+	logs := captureLog(t)
+	svc, prog := fixture(10, 101, "slow")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/services":
+			respond(w, 200, []object{svc})
+			return
+		case "/api/programs":
+			respond(w, 200, []object{prog})
+			return
+		}
+		w.Header().Set("Content-Type", "video/MP2T")
+		w.WriteHeader(200)
+		chunk := bytes.Repeat([]byte{0x47}, 32*1024)
+		for {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+			if r.Context().Err() != nil {
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+	g, err := NewGateway(Config{Listen: ":1", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 30, Backends: []BackendConfig{{ID: "a", URL: upstream.URL + "/api"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Sync(context.Background())
+	server := httptest.NewServer(g)
+	defer server.Close()
+
+	// The subscriber never reads, so its queue overflows while upstream keeps going.
+	resp, err := testClient.Get(server.URL + "/api/services/1000101/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	waitLog(t, logs, "dropping slow subscriber")
+	got := waitLog(t, logs, "via a: dropped (slow subscriber)")
+	requireNotLogged(t, got, "client disconnected", "ended after", "closed pipe")
+}
+
+func TestStreamEndLogsUpstreamFailure(t *testing.T) {
+	logs := captureLog(t)
+	a := newFake(t, 10, "A")
+	a.mu.Lock()
+	a.end = true
+	a.mu.Unlock()
+	_, s := gateway(t, a)
+
+	resp, err := testClient.Get(streamURL(s.URL, 1000101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	got := waitLog(t, logs, "via region0 aborted: EOF")
+	requireNotLogged(t, got, "client disconnected", "ended after", "dropped (slow subscriber)")
+}
+
+func TestStreamEndTextFormat(t *testing.T) {
+	s := newSharedStream(nil, "s", streamKey{}, "", func() {})
+	s.started = time.Now().Add(-(time.Hour + 2*time.Minute + 3*time.Second + 400*time.Millisecond))
+	s.offset = 3328599654 // 3.1 GiB
+	if got, want := s.endText(), "ended after 1h02m03s, 3.1 GiB"; got != want {
+		t.Fatalf("end text %q, want %q", got, want)
 	}
 }

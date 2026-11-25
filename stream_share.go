@@ -55,6 +55,43 @@ type sharedStream struct {
 	ready       chan struct{}
 	status      int
 	offset      int64
+	// droppedSlow records that the last subscriber was dropped for falling
+	// behind, so the closing log names that cause instead of a client error.
+	droppedSlow bool
+}
+
+// endText names why the upstream was canceled: a slow subscriber was dropped,
+// or every subscriber left on its own.
+func (s *sharedStream) endText() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.droppedSlow {
+		return "dropped (slow subscriber)"
+	}
+	return fmt.Sprintf("ended after %s, %s", formatLogDuration(time.Since(s.started)), formatLogBytes(s.offset))
+}
+
+func formatLogDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h, m, s := int64(d/time.Hour), int64(d/time.Minute%60), int64(d/time.Second%60)
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	}
+	return fmt.Sprintf("%dm%02ds", m, s)
+}
+
+// formatLogBytes uses the same binary units and one decimal as the UI.
+func formatLogBytes(n int64) string {
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	v, i := float64(n)/1024, 0
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
 func newSubscriber() *subscriber {
@@ -329,6 +366,11 @@ func (s *sharedStream) Write(p []byte) (int, error) {
 		}
 	}
 	empty := len(s.subscribers) == 0
+	// Only this call's drop explains an empty map; an unsubscribe may have
+	// removed the last subscriber just before this Write took the lock.
+	if empty && len(dropped) > 0 {
+		s.droppedSlow = true
+	}
 	s.mu.Unlock()
 	for _, sub := range dropped {
 		log.Printf("stream %s (%s): dropping slow subscriber %s (%s) after %d bytes", s.id, s.key.label(), sub.id, sub.remote, sub.bytes.Load())

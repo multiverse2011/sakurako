@@ -572,7 +572,7 @@ func (g *Gateway) upstreamStream(w *sharedStream, r *http.Request, sources []sou
 			clientGone = true // client disconnect surfaces as a canceled upstream read
 		}
 		if clientGone {
-			log.Printf("%s via %s: client disconnected: %v", w.key.label(), cfg.ID, cause)
+			log.Printf("%s via %s: %s", w.key.label(), cfg.ID, w.endText())
 		} else {
 			log.Printf("%s via %s aborted: %v", w.key.label(), cfg.ID, cause)
 		}
