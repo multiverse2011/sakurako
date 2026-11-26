@@ -22,6 +22,9 @@ func TestUIStateUsesActualFallbackSource(t *testing.T) {
 	response := openStream(t, server.URL)
 	defer response.Body.Close()
 	snapshot := g.uiState(time.Now())
+	if snapshot["version"] != version {
+		t.Fatalf("state version: %v, want %v", snapshot["version"], version)
+	}
 	groups := snapshot["streams"].([]object)
 	if len(groups) != 1 {
 		t.Fatalf("groups: %v", groups)
@@ -49,6 +52,9 @@ func TestUIStateUsesActualFallbackSource(t *testing.T) {
 	getJSON(t, server.URL+"/-/ui/state", 200, &wire)
 	if len(wire["streams"].([]any)) != 1 {
 		t.Fatal("state route missing shared group")
+	}
+	if wire["version"] != version {
+		t.Fatalf("wire version: %v, want %v", wire["version"], version)
 	}
 }
 
@@ -547,7 +553,7 @@ func TestUIServicesFilterMarkup(t *testing.T) {
 	}
 }
 
-// The UI has no JS test runner; this pins the refresh wiring and the paused label behind the screenshots.
+// The UI has no JS test runner; this pins the refresh wiring, the paused label and the header version/update wiring behind the screenshots.
 func TestUIManualRefreshControls(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"))
 	for _, tc := range []struct{ path, want string }{
@@ -556,6 +562,9 @@ func TestUIManualRefreshControls(t *testing.T) {
 		{"/ui/app.js", `$('refresh').addEventListener`},
 		{"/ui/app.js", `Auto reload paused`},
 		{"/ui/app.js", `pollTuners(true)`},
+		{"/ui/app.js", `renderHeader(next);render()`},
+		{"/ui/app.js", `link.href=update.url`},
+		{"/ui/app.js", "Update available ("},
 	} {
 		recorder := httptest.NewRecorder()
 		g.ServeHTTP(recorder, httptest.NewRequest("GET", tc.path, nil))

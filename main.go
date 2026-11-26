@@ -53,6 +53,7 @@ func main() {
 		log.Printf("%d/%d backends synced at startup", n, len(c.Backends))
 	}
 	go g.Run(ctx)
+	go g.RunUpdateCheck(ctx)
 	srv := &http.Server{Addr: c.Listen, Handler: g, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: serverWriteTimeout(c), IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 * 1024, BaseContext: func(_ net.Listener) context.Context { return ctx }}
 	stopped := make(chan struct{})
 	go func() {

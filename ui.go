@@ -295,7 +295,7 @@ func (g *Gateway) uiState(now time.Time) object {
 	}
 	g.streamsMu.Unlock()
 	sort.Slice(groups, func(i, j int) bool { return groups[i]["id"].(string) < groups[j]["id"].(string) })
-	return object{"downstream_bytes": g.downstreamBytes.Load(), "observed_at": now, "backends": backends, "services": services, "streams": groups, "conflicting_service_ids": cat.conflicts, "sync_seconds": g.config.SyncSeconds}
+	return object{"downstream_bytes": g.downstreamBytes.Load(), "observed_at": now, "backends": backends, "services": services, "streams": groups, "conflicting_service_ids": cat.conflicts, "sync_seconds": g.config.SyncSeconds, "version": version, "update": g.update.get()}
 }
 
 // tunerCounts summarizes live tuner state for the UI. It has its own route
