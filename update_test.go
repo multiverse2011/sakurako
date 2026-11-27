@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -170,7 +169,6 @@ func TestUpdateCheckKeepsLastReleaseOnFailure(t *testing.T) {
 }
 
 func TestRunUpdateCheckRetriesOnInterval(t *testing.T) {
-	t.Setenv("SAKURAKO_UPDATE_CHECK", "")
 	setVersion(t, "0.4.0")
 	var requests atomic.Int32
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -258,10 +256,10 @@ func TestNewerVersion(t *testing.T) {
 }
 
 func TestUpdateCheckDisabledSkipsGitHub(t *testing.T) {
-	t.Setenv("SAKURAKO_UPDATE_CHECK", " FALSE ")
 	s, requests := releaseServer(t, 200, releaseBody)
 	setUpdateCheck(t, s.URL, time.Millisecond)
 	g, server := gateway(t, newFake(t, 10, "service"))
+	g.config.UpdateCheck = false // before RunUpdateCheck and the request below
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -293,21 +291,6 @@ func TestUpdateCheckIntervalIsSixHours(t *testing.T) {
 	}
 }
 
-func TestUpdateCheckEnabled(t *testing.T) {
-	for _, tc := range []struct {
-		value string
-		want  bool
-	}{
-		{"", true}, {"true", true}, {" TRUE ", true}, {"1", true},
-		{"false", false}, {" False ", false},
-	} {
-		t.Setenv("SAKURAKO_UPDATE_CHECK", tc.value)
-		if got := updateCheckEnabled(); got != tc.want {
-			t.Errorf("updateCheckEnabled(%q) = %v, want %v", tc.value, got, tc.want)
-		}
-	}
-}
-
 func TestReadConfigUpdateCheck(t *testing.T) {
 	for raw, want := range map[string]bool{
 		`{"backends":[{"id":"a","url":"http://h/api"}]}`:                      true,
@@ -328,29 +311,21 @@ func TestReadConfigUpdateCheck(t *testing.T) {
 	}
 }
 
-// The check runs only when both the config and SAKURAKO_UPDATE_CHECK allow it.
-func TestRunUpdateCheckConfigAndEnv(t *testing.T) {
+// The check runs only when update_check is true.
+func TestRunUpdateCheckFollowsConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		config bool
-		env    string
-		want   bool
-		logged bool // the deprecation line for SAKURAKO_UPDATE_CHECK
 	}{
-		{"both enabled", true, "", true, false},
-		{"env other than false", true, "0", true, false},
-		{"config disabled", false, "", false, false},
-		{"env disabled", true, "false", false, true},
-		{"both disabled", false, " FALSE ", false, true},
+		{"enabled", true},
+		{"disabled", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("SAKURAKO_UPDATE_CHECK", tc.env)
 			setVersion(t, "0.4.0")
 			s, requests := releaseServer(t, 200, releaseBody)
 			setUpdateCheck(t, s.URL, time.Hour)
 			g, _ := gateway(t, newFake(t, 10, "service"))
 			g.config.UpdateCheck = tc.config // before RunUpdateCheck starts, so no race
-			logs := captureLog(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := make(chan struct{})
@@ -358,7 +333,7 @@ func TestRunUpdateCheckConfigAndEnv(t *testing.T) {
 				defer close(done)
 				g.RunUpdateCheck(ctx)
 			}()
-			if tc.want {
+			if tc.config {
 				deadline := time.Now().Add(2 * time.Second)
 				for g.update.get() == nil {
 					if time.Now().After(deadline) {
@@ -373,10 +348,7 @@ func TestRunUpdateCheckConfigAndEnv(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("RunUpdateCheck kept running")
 			}
-			if got := logs.String(); tc.logged != strings.Contains(got, "SAKURAKO_UPDATE_CHECK") {
-				t.Fatalf("log with env %q:\n%s", tc.env, got)
-			}
-			if !tc.want {
+			if !tc.config {
 				if got := requests.Load(); got != 0 {
 					t.Fatalf("requests: %d, want none", got)
 				}
