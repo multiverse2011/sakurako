@@ -39,8 +39,8 @@ func (c *updateCache) set(latest object) {
 	c.mu.Unlock()
 }
 
-// updateCheckEnabled honors SAKURAKO_UPDATE_CHECK: unset or any value other than
-// "false" enables the check.
+// updateCheckEnabled honors SAKURAKO_UPDATE_CHECK, kept for v0.5.0 compatibility:
+// unset or any value other than "false" enables the check.
 func updateCheckEnabled() bool {
 	return !strings.EqualFold(strings.TrimSpace(os.Getenv("SAKURAKO_UPDATE_CHECK")), "false")
 }
@@ -50,6 +50,10 @@ func updateCheckEnabled() bool {
 // Run never reach the network.
 func (g *Gateway) RunUpdateCheck(ctx context.Context) {
 	if !updateCheckEnabled() {
+		log.Printf("warning: update check disabled by SAKURAKO_UPDATE_CHECK=false; set \"update_check\": false in the config instead")
+		return
+	}
+	if !g.config.UpdateCheck {
 		return
 	}
 	t := time.NewTicker(updateCheckInterval)

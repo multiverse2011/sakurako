@@ -265,7 +265,7 @@ func gatewayWithCatalogTimeout(t *testing.T, catalogSeconds int, fs ...*fakeBack
 // gatewayWithTimeouts builds a gateway with the given catalog and stream timeouts.
 func gatewayWithTimeouts(t *testing.T, catalogSeconds, streamSeconds int, fs ...*fakeBackend) (*Gateway, *httptest.Server) {
 	t.Helper()
-	c := Config{Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: catalogSeconds, MaxStaleSeconds: 60, StreamTimeoutSeconds: streamSeconds}
+	c := Config{Listen: ":40772", SyncSeconds: 1, CatalogTimeoutSeconds: catalogSeconds, MaxStaleSeconds: 60, StreamTimeoutSeconds: streamSeconds, UpdateCheck: true}
 	for i, f := range fs {
 		c.Backends = append(c.Backends, BackendConfig{ID: fmt.Sprintf("region%d", i), URL: f.server.URL + "/api", Priority: 100 - i, ServiceDomain: "confirmed-broadcasts"})
 	}

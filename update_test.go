@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -302,5 +304,85 @@ func TestUpdateCheckEnabled(t *testing.T) {
 		if got := updateCheckEnabled(); got != tc.want {
 			t.Errorf("updateCheckEnabled(%q) = %v, want %v", tc.value, got, tc.want)
 		}
+	}
+}
+
+func TestReadConfigUpdateCheck(t *testing.T) {
+	for raw, want := range map[string]bool{
+		`{"backends":[{"id":"a","url":"http://h/api"}]}`:                      true,
+		`{"update_check":false,"backends":[{"id":"a","url":"http://h/api"}]}`: false,
+		`{"update_check":true,"backends":[{"id":"a","url":"http://h/api"}]}`:  true,
+	} {
+		p := filepath.Join(t.TempDir(), "sakurako.json")
+		if err := os.WriteFile(p, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := readConfig(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.UpdateCheck != want {
+			t.Errorf("%s: update_check = %v, want %v", raw, c.UpdateCheck, want)
+		}
+	}
+}
+
+// The check runs only when both the config and SAKURAKO_UPDATE_CHECK allow it.
+func TestRunUpdateCheckConfigAndEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config bool
+		env    string
+		want   bool
+	}{
+		{"both enabled", true, "", true},
+		{"env other than false", true, "0", true},
+		{"config disabled", false, "", false},
+		{"env disabled", true, "false", false},
+		{"both disabled", false, " FALSE ", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SAKURAKO_UPDATE_CHECK", tc.env)
+			setVersion(t, "0.4.0")
+			s, requests := releaseServer(t, 200, releaseBody)
+			setUpdateCheck(t, s.URL, time.Hour)
+			base, _ := gateway(t, newFake(t, 10, "service"))
+			c := base.config
+			c.UpdateCheck = tc.config
+			g, err := NewGateway(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				g.RunUpdateCheck(ctx)
+			}()
+			if tc.want {
+				deadline := time.Now().Add(2 * time.Second)
+				for g.update.get() == nil {
+					if time.Now().After(deadline) {
+						t.Fatalf("no release found after %d requests", requests.Load())
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				cancel()
+			}
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("RunUpdateCheck kept running")
+			}
+			if !tc.want {
+				if got := requests.Load(); got != 0 {
+					t.Fatalf("requests: %d, want none", got)
+				}
+				if update := g.update.get(); update != nil {
+					t.Fatalf("update: %v, want nil", update)
+				}
+			}
+		})
 	}
 }
