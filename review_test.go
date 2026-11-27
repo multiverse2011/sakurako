@@ -169,21 +169,23 @@ func TestFetchRejectsBadBodies(t *testing.T) {
 // Programs answer with their upstream JSON unchanged, and the four fields are
 // validated with the same rules objects used to get.
 func TestFetchProgramsKeepsUpstreamJSON(t *testing.T) {
-	var body string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
-	defer srv.Close()
-	g, err := NewGateway(Config{Listen: ":1", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 1, Backends: []BackendConfig{{ID: "a", URL: srv.URL}}})
-	if err != nil {
-		t.Fatal(err)
+	fetch := func(t *testing.T, body string) []program {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		defer srv.Close()
+		g, err := NewGateway(Config{Listen: ":1", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 1, Backends: []BackendConfig{{ID: "a", URL: srv.URL}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		programs, err := g.fetchPrograms(context.Background(), g.backends[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return programs
 	}
-	fetch := func() ([]program, error) { return g.fetchPrograms(context.Background(), g.backends[0]) }
 
 	raw := `{"genre":1,"id":10001000003,"networkId":1,"serviceId":10,"eventId":3}`
-	body = "[" + raw + "]"
-	programs, err := fetch()
-	if err != nil {
-		t.Fatal(err)
-	}
+	programs := fetch(t, "["+raw+"]")
 	if len(programs) != 1 || string(programs[0].raw) != raw || programs[0].id != 10001000003 || programs[0].networkID != 1 || programs[0].serviceID != 10 || programs[0].eventID != 3 {
 		t.Fatalf("unexpected program: %+v", programs)
 	}
@@ -191,11 +193,7 @@ func TestFetchProgramsKeepsUpstreamJSON(t *testing.T) {
 		t.Fatalf("good program rejected: %v", err)
 	}
 	for _, bad := range []string{`"id":"10001000003"`, `"id":10001000003.5`} {
-		body = "[" + strings.Replace(raw, `"id":10001000003`, bad, 1) + "]"
-		programs, err := fetch()
-		if err != nil {
-			t.Fatalf("%s: %v", bad, err)
-		}
+		programs := fetch(t, "["+strings.Replace(raw, `"id":10001000003`, bad, 1)+"]")
 		if err := validateCatalog(nil, programs); err == nil {
 			t.Errorf("%s: accepted as a program id", bad)
 		}
@@ -220,6 +218,9 @@ func TestHTTPBoundaries(t *testing.T) {
 		{"GET", "/api/programs?networkId=70000", 400},
 		{"GET", "/api/programs?networkId=x", 400},
 		{"GET", "/api/programs?bogus=1", 400},
+		{"GET", "/api/programs/abc", 400},
+		{"GET", "/api/programs/999", 404},
+		{"GET", "/api/programs/100010100003/x", 404},
 	} {
 		req, _ := http.NewRequest(tc.method, s.URL+tc.path, nil)
 		resp, err := testClient.Do(req)

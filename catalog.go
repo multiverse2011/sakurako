@@ -20,12 +20,13 @@ import (
 )
 
 // object preserves upstream extension fields. Integer precision survives only
-// because fetch decodes with json.Decoder.UseNumber; other decoders yield float64.
+// because decodeObjects decodes with json.Decoder.UseNumber; other decoders yield
+// float64.
 type object map[string]any
 
 // program keeps the four fields the gateway reads plus the upstream JSON it
-// answers with. Decoding a program into object retained a map per field, roughly
-// ten times the upstream bytes when the catalog is large.
+// answers with. Decoding a program into object retained a map per program,
+// roughly ten times the upstream bytes when the catalog is large.
 type program struct {
 	networkID, serviceID, eventID, id int64
 	raw                               json.RawMessage
@@ -288,15 +289,18 @@ func (g *Gateway) fetchPrograms(ctx context.Context, b backend) ([]program, erro
 	if err != nil {
 		return nil, err
 	}
-	// The maps are thrown away right after, so this costs no memory beyond one
-	// program while keeping number()'s validation exactly as the object path.
-	objects, err := decodeObjects(items, b.config.ID, path)
-	if err != nil {
-		return nil, err
-	}
 	programs := make([]program, len(items))
-	for i, o := range objects {
-		programs[i] = program{networkID: number(o, "networkId"), serviceID: number(o, "serviceId"), eventID: number(o, "eventId"), id: number(o, "id"), raw: items[i]}
+	for i, item := range items {
+		// One map at a time: reading the four fields through number() keeps the
+		// validation identical to the object path, and the map is dropped before
+		// the next element.
+		var o object
+		d := json.NewDecoder(bytes.NewReader(item))
+		d.UseNumber()
+		if err := d.Decode(&o); err != nil {
+			return nil, fmt.Errorf("GET %s%s: must be a JSON array of objects: %w", b.config.ID, path, err)
+		}
+		programs[i] = program{networkID: number(o, "networkId"), serviceID: number(o, "serviceId"), eventID: number(o, "eventId"), id: number(o, "id"), raw: item}
 	}
 	return programs, nil
 }
