@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -334,25 +335,22 @@ func TestRunUpdateCheckConfigAndEnv(t *testing.T) {
 		config bool
 		env    string
 		want   bool
+		logged bool // the deprecation line for SAKURAKO_UPDATE_CHECK
 	}{
-		{"both enabled", true, "", true},
-		{"env other than false", true, "0", true},
-		{"config disabled", false, "", false},
-		{"env disabled", true, "false", false},
-		{"both disabled", false, " FALSE ", false},
+		{"both enabled", true, "", true, false},
+		{"env other than false", true, "0", true, false},
+		{"config disabled", false, "", false, false},
+		{"env disabled", true, "false", false, true},
+		{"both disabled", false, " FALSE ", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("SAKURAKO_UPDATE_CHECK", tc.env)
 			setVersion(t, "0.4.0")
 			s, requests := releaseServer(t, 200, releaseBody)
 			setUpdateCheck(t, s.URL, time.Hour)
-			base, _ := gateway(t, newFake(t, 10, "service"))
-			c := base.config
-			c.UpdateCheck = tc.config
-			g, err := NewGateway(c)
-			if err != nil {
-				t.Fatal(err)
-			}
+			g, _ := gateway(t, newFake(t, 10, "service"))
+			g.config.UpdateCheck = tc.config // before RunUpdateCheck starts, so no race
+			logs := captureLog(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := make(chan struct{})
@@ -374,6 +372,9 @@ func TestRunUpdateCheckConfigAndEnv(t *testing.T) {
 			case <-done:
 			case <-time.After(2 * time.Second):
 				t.Fatal("RunUpdateCheck kept running")
+			}
+			if got := logs.String(); tc.logged != strings.Contains(got, "SAKURAKO_UPDATE_CHECK") {
+				t.Fatalf("log with env %q:\n%s", tc.env, got)
 			}
 			if !tc.want {
 				if got := requests.Load(); got != 0 {

@@ -47,10 +47,11 @@ func updateCheckEnabled() bool {
 
 // RunUpdateCheck checks once at startup and then every updateCheckInterval. It is
 // a separate loop from Run so startup never waits on GitHub and tests calling
-// Run never reach the network.
+// Run never reach the network. It returns at once when update_check is false or
+// SAKURAKO_UPDATE_CHECK=false (the latter logs one line).
 func (g *Gateway) RunUpdateCheck(ctx context.Context) {
 	if !updateCheckEnabled() {
-		log.Printf("warning: update check disabled by SAKURAKO_UPDATE_CHECK=false; set \"update_check\": false in the config instead")
+		log.Printf("warning: update check disabled by SAKURAKO_UPDATE_CHECK=false; set \"update_check\": false in the config and remove the variable")
 		return
 	}
 	if !g.config.UpdateCheck {
