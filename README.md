@@ -63,7 +63,7 @@ docker compose up -d
 
 Linux の Docker で `host.docker.internal` を使うには、compose に `extra_hosts: ["host.docker.internal:host-gateway"]` が必要です。同じホストの Mirakurun を `localhost` で指定すると、コンテナ自身を指すため接続できません。
 
-LAN の別の PC から管理画面を開く場合は、`ports` の `127.0.0.1:` を外してください。
+LAN の別の PC から管理画面を開く場合は、`ports` の `127.0.0.1:` を外してください。ただし Sakurako には認証がなく、外すと管理画面と API（配信を含む）が LAN 全体に開きます。また Docker が公開したポートは ufw などホストのファイアウォールを通らないため、信頼できる LAN でだけ外してください。
 
 Runtime の Environment は、目印（`/.dockerenv` など）のある Docker / Podman / Kubernetes だけを判定します。それ以外のコンテナで動かした場合も Native と表示されます。
 
