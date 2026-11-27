@@ -20,18 +20,31 @@ import (
 )
 
 // object preserves upstream extension fields. Integer precision survives only
-// because fetch decodes with json.Decoder.UseNumber; other decoders yield float64.
+// because decodeObjects decodes with json.Decoder.UseNumber; other decoders yield
+// float64.
 type object map[string]any
+
+// program keeps the four fields the gateway reads plus the upstream JSON it
+// answers with. Decoding a program into object retained a map per program,
+// roughly ten times the upstream bytes when the catalog is large.
+type program struct {
+	networkID, serviceID, eventID, id int64
+	raw                               json.RawMessage
+}
+
+func (p program) MarshalJSON() ([]byte, error) { return p.raw, nil }
+
 type backend struct {
-	config             BackendConfig
-	base               *url.URL // parsed config.URL, fixed after NewGateway
-	services, programs []object
-	updated            time.Time
-	healthy            bool
-	blockedUntil       time.Time            // backend-wide stream cooldown (500/502/other 5xx, mid-stream read failure)
-	blockedServices    map[int64]time.Time  // per-service cooldown (pre-body 404/408/429/503, empty/first-byte timeout)
-	blockedChannels    map[string]time.Time // per-channel cooldown for channel streams (same failure classes)
-	err                string
+	config          BackendConfig
+	base            *url.URL // parsed config.URL, fixed after NewGateway
+	services        []object
+	programs        []program
+	updated         time.Time
+	healthy         bool
+	blockedUntil    time.Time            // backend-wide stream cooldown (500/502/other 5xx, mid-stream read failure)
+	blockedServices map[int64]time.Time  // per-service cooldown (pre-body 404/408/429/503, empty/first-byte timeout)
+	blockedChannels map[string]time.Time // per-channel cooldown for channel streams (same failure classes)
+	err             string
 }
 
 // status reports whether the catalog is fresh and healthy; callers apply stream cooldowns separately.
@@ -45,11 +58,12 @@ type source struct {
 	service object
 }
 type catalog struct {
-	services, programs, channels []object
-	sources                      map[int64][]source
-	channelSources               map[string][]source // exposed channel type + "/" + channel name
-	conflicts                    []int64
-	channelConflicts             []channelConflict
+	services, channels []object
+	programs           []program
+	sources            map[int64][]source
+	channelSources     map[string][]source // exposed channel type + "/" + channel name
+	conflicts          []int64
+	channelConflicts   []channelConflict
 	// gen identifies this snapshot; response ETags are derived from it, so it
 	// changes whenever the snapshot may.
 	gen uint64
@@ -197,7 +211,7 @@ func apiURL(base *url.URL, path, rawQuery string) string {
 	return u.String()
 }
 
-func (g *Gateway) fetch(ctx context.Context, b backend, path string) ([]object, error) {
+func (g *Gateway) getBody(ctx context.Context, b backend, path string) ([]byte, error) {
 	id := b.config.ID
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL(b.base, path, ""), nil)
 	if err != nil {
@@ -219,9 +233,14 @@ func (g *Gateway) fetch(ctx context.Context, b backend, path string) ([]object, 
 	if len(raw) > limit {
 		return nil, fmt.Errorf("GET %s%s: body larger than 64 MiB", id, path)
 	}
-	var items []object
+	return raw, nil
+}
+
+// arrayElements returns the elements of the upstream JSON array in raw, each
+// copied so the response buffer itself can be collected.
+func arrayElements(raw []byte, id, path string) ([]json.RawMessage, error) {
+	var items []json.RawMessage
 	d := json.NewDecoder(bytes.NewReader(raw))
-	d.UseNumber()
 	if err := d.Decode(&items); err != nil {
 		return nil, fmt.Errorf("GET %s%s: must be a JSON array of objects: %w", id, path, err)
 	}
@@ -233,7 +252,59 @@ func (g *Gateway) fetch(ctx context.Context, b backend, path string) ([]object, 
 	}
 	return items, nil
 }
-func validateCatalog(services, programs []object) error {
+
+// decodeObjects decodes each element on its own, with UseNumber so integer ids
+// survive.
+func decodeObjects(items []json.RawMessage, id, path string) ([]object, error) {
+	out := make([]object, len(items))
+	for i, item := range items {
+		d := json.NewDecoder(bytes.NewReader(item))
+		d.UseNumber()
+		if err := d.Decode(&out[i]); err != nil {
+			return nil, fmt.Errorf("GET %s%s: must be a JSON array of objects: %w", id, path, err)
+		}
+	}
+	return out, nil
+}
+
+func (g *Gateway) fetch(ctx context.Context, b backend, path string) ([]object, error) {
+	raw, err := g.getBody(ctx, b, path)
+	if err != nil {
+		return nil, err
+	}
+	items, err := arrayElements(raw, b.config.ID, path)
+	if err != nil {
+		return nil, err
+	}
+	return decodeObjects(items, b.config.ID, path)
+}
+
+func (g *Gateway) fetchPrograms(ctx context.Context, b backend) ([]program, error) {
+	path := "/programs"
+	raw, err := g.getBody(ctx, b, path)
+	if err != nil {
+		return nil, err
+	}
+	items, err := arrayElements(raw, b.config.ID, path)
+	if err != nil {
+		return nil, err
+	}
+	programs := make([]program, len(items))
+	for i, item := range items {
+		// One map at a time: reading the four fields through number() keeps the
+		// validation identical to the object path, and the map is dropped before
+		// the next element.
+		var o object
+		d := json.NewDecoder(bytes.NewReader(item))
+		d.UseNumber()
+		if err := d.Decode(&o); err != nil {
+			return nil, fmt.Errorf("GET %s%s: must be a JSON array of objects: %w", b.config.ID, path, err)
+		}
+		programs[i] = program{networkID: number(o, "networkId"), serviceID: number(o, "serviceId"), eventID: number(o, "eventId"), id: number(o, "id"), raw: item}
+	}
+	return programs, nil
+}
+func validateCatalog(services []object, programs []program) error {
 	known := map[int64]bool{}
 	for _, s := range services {
 		n, sid, id := number(s, "networkId"), number(s, "serviceId"), number(s, "id")
@@ -256,7 +327,7 @@ func validateCatalog(services, programs []object) error {
 	}
 	seen := map[int64]bool{}
 	for _, p := range programs {
-		n, s, e, id := number(p, "networkId"), number(p, "serviceId"), number(p, "eventId"), number(p, "id")
+		n, s, e, id := p.networkID, p.serviceID, p.eventID, p.id
 		switch {
 		case n < 0 || n > 65535 || s < 0 || s > 65535 || e < 0 || e > 65535:
 			return fmt.Errorf("program id=%d: networkId=%d/serviceId=%d/eventId=%d out of range", id, n, s, e)
@@ -288,9 +359,9 @@ func (g *Gateway) Sync(ctx context.Context) {
 			c, cancel := context.WithTimeout(ctx, time.Duration(g.config.CatalogTimeoutSeconds)*time.Second)
 			defer cancel()
 			s, err := g.fetch(c, b, "/services")
-			var p []object
+			var p []program
 			if err == nil {
-				p, err = g.fetch(c, b, "/programs")
+				p, err = g.fetchPrograms(c, b)
 			}
 			if err == nil {
 				err = validateCatalog(s, p)
@@ -398,7 +469,7 @@ func (g *Gateway) catalogNow(now time.Time) catalog {
 // (mu.Lock) — or be NewGateway before the gateway is shared.
 func (g *Gateway) buildCatalog(now time.Time) catalog {
 	g.gen++
-	c := catalog{gen: g.gen, programsJSON: &jsonBody{}, services: []object{}, programs: []object{}, channels: []object{}, sources: map[int64][]source{}, channelSources: map[string][]source{}, conflicts: []int64{}, channelConflicts: []channelConflict{}}
+	c := catalog{gen: g.gen, programsJSON: &jsonBody{}, services: []object{}, programs: []program{}, channels: []object{}, sources: map[int64][]source{}, channelSources: map[string][]source{}, conflicts: []int64{}, channelConflicts: []channelConflict{}}
 	maxStale := time.Duration(g.config.MaxStaleSeconds) * time.Second
 	fresh := make([]bool, len(g.backends))
 	for i, b := range g.backends {
@@ -446,7 +517,7 @@ func (g *Gateway) buildCatalog(now time.Time) catalog {
 	}
 	for i, b := range g.backends {
 		for _, p := range b.programs {
-			id := number(p, "networkId")*100000 + number(p, "serviceId")
+			id := p.networkID*100000 + p.serviceID
 			if a, ok := authority[id]; ok && a == i {
 				c.programs = append(c.programs, p)
 			}
@@ -547,7 +618,7 @@ func (g *Gateway) buildCatalog(now time.Time) catalog {
 		c.channels = append(c.channels, ch)
 	}
 	sortObjects(c.services)
-	sortObjects(c.programs)
+	sort.Slice(c.programs, func(i, j int) bool { return c.programs[i].id < c.programs[j].id })
 	sort.Slice(c.conflicts, func(i, j int) bool { return c.conflicts[i] < c.conflicts[j] })
 	sort.Slice(c.channelConflicts, func(i, j int) bool { return c.channelConflicts[i].key < c.channelConflicts[j].key })
 	sort.Slice(c.channels, func(i, j int) bool {
