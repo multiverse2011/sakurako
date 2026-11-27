@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -85,7 +88,7 @@ func TestUIStateStartingAndSharedClients(t *testing.T) {
 
 func TestUIRoutesAndMethodPolicy(t *testing.T) {
 	g, _ := gateway(t, newFake(t, 10, "service"))
-	for _, path := range []string{"/ui/", "/ui/style.css", "/ui/app.js", "/ui/favicon.svg", "/-/ui/state", "/-/ui/tuners", "/-/ui/config", "/-/ui/logs"} {
+	for _, path := range []string{"/ui/", "/ui/style.css", "/ui/app.js", "/ui/favicon.svg", "/-/ui/state", "/-/ui/tuners", "/-/ui/config", "/-/ui/runtime", "/-/ui/logs"} {
 		recorder := httptest.NewRecorder()
 		g.ServeHTTP(recorder, httptest.NewRequest("GET", path, nil))
 		if recorder.Code != 200 {
@@ -645,6 +648,18 @@ func TestUISharedServiceListsEveryCandidate(t *testing.T) {
 	}
 }
 
+func TestBackendUIURLOverride(t *testing.T) {
+	base, _ := url.Parse("http://mirakurun:40772/api")
+	b := &backend{config: BackendConfig{UIURL: "http://192.168.1.10:40772/"}, base: base}
+	if got := backendUIURL(b); got != "http://192.168.1.10:40772/" {
+		t.Fatalf("ui_url not used: %s", got)
+	}
+	b.config.UIURL = ""
+	if got := backendUIURL(b); got != "http://mirakurun:40772/" {
+		t.Fatalf("fallback: %s", got)
+	}
+}
+
 func TestMirakurunUIURL(t *testing.T) {
 	for input, want := range map[string]string{
 		"http://host:40772/api":   "http://host:40772/",
@@ -860,5 +875,62 @@ func TestOpenAPIConditionalRequests(t *testing.T) {
 		if w.Code != http.StatusNotModified || w.Body.Len() != 0 || w.Header().Get("ETag") != etag {
 			t.Fatalf("%s: %d %q %d", path, w.Code, w.Header().Get("ETag"), w.Body.Len())
 		}
+	}
+}
+
+func TestProcRSS(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "status")
+	if err := os.WriteFile(p, []byte("Name:\tsakurako\nVmRSS:\t   12345 kB\nThreads:\t8\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := procRSS(p); got != int64(12345*1024) {
+		t.Fatalf("got %v", got)
+	}
+	if got := procRSS(p + ".missing"); got != nil {
+		t.Fatalf("missing file: %v", got)
+	}
+	for name, raw := range map[string]string{"no-vmrss": "Name:\tsakurako\n", "not-a-number": "VmRSS:\t   abc kB\n"} {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if got := procRSS(p); got != nil {
+			t.Fatalf("%s: %v", name, got)
+		}
+	}
+}
+
+func TestUIRuntimeEndpoint(t *testing.T) {
+	_, server := gateway(t, newFake(t, 10, "service"))
+	response, err := http.Get(server.URL + "/-/ui/runtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if got := response.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control: %q", got)
+	}
+	var wire map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"environment", "hostname", "rss_bytes", "heap_bytes", "goroutines", "started"} {
+		if _, ok := wire[key]; !ok {
+			t.Fatalf("missing %s: %v", key, wire)
+		}
+	}
+}
+
+func TestUIStateBackendUIURLFromConfig(t *testing.T) {
+	g, server := gateway(t, newFake(t, 10, "service"))
+	changeBackend(g, 0, func(b *backend) { b.config.UIURL = "http://192.168.1.10:40772/" })
+	var wire struct {
+		Backends []struct {
+			UIURL string `json:"ui_url"`
+		} `json:"backends"`
+	}
+	getJSON(t, server.URL+"/-/ui/state", 200, &wire)
+	if len(wire.Backends) != 1 || wire.Backends[0].UIURL != "http://192.168.1.10:40772/" {
+		t.Fatalf("backends: %+v", wire.Backends)
 	}
 }

@@ -19,6 +19,8 @@ type BackendConfig struct {
 	Priority int    `json:"priority"`
 	// Equal domains explicitly assert equal broadcasts for equal network/service IDs.
 	ServiceDomain string `json:"service_domain"`
+	// UIURL overrides the admin UI link when the browser cannot reach URL (e.g. a Docker service name).
+	UIURL string `json:"ui_url,omitempty"`
 }
 
 // Config is the gateway's JSON configuration, loaded from a file.
@@ -112,6 +114,11 @@ func (c Config) validate() error {
 		if port := u.Port(); port != "" {
 			if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 				return fmt.Errorf("invalid backend URL for %s: port must be 1..65535 (got %q)", b.ID, port)
+			}
+		}
+		if b.UIURL != "" {
+			if u, err := url.Parse(b.UIURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return fmt.Errorf("invalid ui_url for %s: HTTP(S) URL required (got %q)", b.ID, b.UIURL)
 			}
 		}
 	}
