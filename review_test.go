@@ -116,6 +116,9 @@ func TestReadConfigDefaultsChannelNames(t *testing.T) {
 	if _, err := readConfig(write("bad.json", `{"channel_names":"bogus","backends":[{"id":"a","url":"http://h/api"}]}`)); err == nil {
 		t.Fatal("invalid channel_names accepted")
 	}
+	if _, err := readConfig(write("ui.json", `{"backends":[{"id":"a","url":"http://h/api","ui_url":"javascript:alert(1)"}]}`)); err == nil {
+		t.Fatal("non-HTTP ui_url accepted")
+	}
 }
 
 func TestServerWriteTimeout(t *testing.T) {

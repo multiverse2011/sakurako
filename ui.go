@@ -164,6 +164,11 @@ func (g *Gateway) serveUI(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	}
+	if r.URL.Path == "/-/ui/runtime" {
+		w.Header().Set("Cache-Control", "no-store")
+		respond(w, 200, runtimeInfo())
+		return true
+	}
 	if r.URL.Path == "/-/ui/config" {
 		w.Header().Set("Cache-Control", "no-store")
 		respond(w, 200, g.config)
@@ -257,7 +262,7 @@ func (g *Gateway) uiState(now time.Time) object {
 		} else if !healthy {
 			state = "Using cached catalog"
 		}
-		backends = append(backends, object{"id": b.config.ID, "ui_url": mirakurunUIURL(b.base), "catalog_state": state, "catalog_available": fresh, "healthy": healthy, "available": healthy && !now.Before(b.blockedUntil), "last_success": nilIfZero(b.updated), "retry_after": nilIfExpired(now, b.blockedUntil), "domain": serviceDomain(b.config), "priority": b.config.Priority})
+		backends = append(backends, object{"id": b.config.ID, "ui_url": backendUIURL(b), "catalog_state": state, "catalog_available": fresh, "healthy": healthy, "available": healthy && !now.Before(b.blockedUntil), "last_success": nilIfZero(b.updated), "retry_after": nilIfExpired(now, b.blockedUntil), "domain": serviceDomain(b.config), "priority": b.config.Priority})
 	}
 	for _, svc := range cat.services {
 		id := number(svc, "id")
@@ -453,6 +458,13 @@ func freeByTypeList(counts map[string]int) []object {
 		out = append(out, object{"type": typ, "free": counts[typ]})
 	}
 	return out
+}
+
+func backendUIURL(b *backend) string {
+	if b.config.UIURL != "" {
+		return b.config.UIURL
+	}
+	return mirakurunUIURL(b.base)
 }
 
 // mirakurunUIURL preserves reverse-proxy prefixes while removing the Mirakurun API suffix.

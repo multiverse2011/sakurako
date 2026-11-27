@@ -47,10 +47,19 @@ services:
 docker compose up -d
 ```
 
-同じホストのアプリからは `http://localhost:40772` に接続できます。同じ Compose 内のアプリからは `http://sakurako:40772` を指定します。
-ホスト側のポートが Mirakurun と重なる場合は、`127.0.0.1:40773:40772` などに変更してください。
+`ports` は `ホスト側:コンテナ側` です。コンテナ側は `listen`（既定 `:40772`）と合わせ、ホスト側は自由に変えられます。同じホストで Mirakurun が 40772 を使っている場合は、`127.0.0.1:40773:40772` のようにホスト側だけ変更してください。
 
-管理画面は `http://localhost:40772/ui/`、API ドキュメントは `/ui/docs.html` で開けます。
+以下の `40772` は、ホスト側のポートに読み替えてください。
+
+- 同じホストのアプリ: `http://localhost:40772`
+- 同じ Compose 内のアプリ: `http://sakurako:40772`（コンテナ間はコンテナ側のポートを使うため、ホスト側を変えても 40772 のまま）
+- 管理画面: `http://localhost:40772/ui/`、API ドキュメント: `/ui/docs.html`
+
+管理画面の Settings の Runtime には、実行環境（Docker / Podman / Kubernetes / Native）・ホスト名・メモリ使用量（RSS）などが表示されます。Docker ではホスト名がコンテナ ID になるため、分かりやすい名前にしたい場合は compose の `hostname:` を指定してください。
+
+管理画面の Settings に表示される `Listen` はコンテナ内で待ち受けているアドレスで、ブラウザで開いているアドレスは `Accessed via` に表示されます。
+
+`backends[].url` に Compose のサービス名や `host.docker.internal` を指定すると、管理画面の Mirakurun へのリンクがブラウザから開けません。その場合は `backends[].ui_url` にブラウザから開ける URL を指定してください。
 
 ## 設定
 
@@ -62,6 +71,7 @@ docker compose up -d
 | `backends[].id` | 必須 | 接続先の一意の名前。英数字・`_`・`-` が使用可能 |
 | `backends[].url` | 必須 | Mirakurun の API URL（末尾に `/api`） |
 | `backends[].priority` | `0` | 配信元の優先度。0 以上で、大きい値を優先 |
+| `backends[].ui_url` | `url` から `/api` を除いたもの | 管理画面から開く Mirakurun の URL。ブラウザから `url` に届かない場合に指定 |
 | `backends[].service_domain` | 接続先ごとに区別 | 同じ放送を提供する接続先を冗長化する場合に、同じ値を指定 |
 | `channel_names` | `virtual` | チャンネル名に接続先の ID を付加。`upstream` で元の名前を使用 |
 | `sync_seconds` | `30` | 番組情報などの同期間隔（秒） |

@@ -35,7 +35,7 @@
           "nullable": true
           "type": "string"
         "ui_url":
-          "description": "Mirakurun UI base URL derived from the backend API base."
+          "description": "Mirakurun UI base URL: backends[].ui_url when configured, otherwise derived from the backend API base."
           "type": "string"
       "type": "object"
     "CatalogService":
