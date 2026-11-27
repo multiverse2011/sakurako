@@ -262,47 +262,23 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.stream(w, r, id, sources)
 		return
 	}
+	if parts[1] == "programs" {
+		servePrograms(w, r, cat, parts[2:])
+		return
+	}
 	var items []object
 	switch parts[1] {
 	case "services":
 		items = cat.services
-	case "programs":
-		items = cat.programs
 	case "channels":
 		items = cat.channels
-	default:
-		apiError(w, 404, "endpoint not supported")
-		return
 	}
-	if parts[1] == "programs" {
-		for key, vals := range r.URL.Query() {
-			if (key != "networkId" && key != "serviceId" && key != "eventId") || len(vals) != 1 {
-				apiError(w, 400, "only numeric networkId/serviceId/eventId filters are supported")
-				return
-			}
-			value, err := strconv.ParseInt(vals[0], 10, 64)
-			if err != nil || value < 0 || value > 65535 {
-				apiError(w, 400, "invalid program filter")
-				return
-			}
-			filtered := []object{}
-			for _, p := range items {
-				if number(p, key) == value {
-					filtered = append(filtered, p)
-				}
-			}
-			items = filtered
-		}
-	} else if r.URL.RawQuery != "" {
+	if r.URL.RawQuery != "" {
 		apiError(w, 400, "query options are not supported here")
 		return
 	}
 	if len(parts) == 2 {
-		var cached *jsonBody
-		if parts[1] == "programs" && r.URL.RawQuery == "" {
-			cached = cat.programsJSON
-		}
-		serveCatalog(w, r, cat.gen, items, cached)
+		serveCatalog(w, r, cat.gen, items, nil)
 		return
 	}
 	if parts[1] == "channels" {
@@ -321,16 +297,70 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if parts[1] == "services" {
-			for _, c := range cat.conflicts {
-				if c == id {
-					apiError(w, 409, "service identity conflict between backends")
-					return
-				}
+		for _, c := range cat.conflicts {
+			if c == id {
+				apiError(w, 409, "service identity conflict between backends")
+				return
 			}
 		}
 	}
 	apiError(w, 404, "not found")
+}
+
+// servePrograms answers /api/programs: the whole list, the list narrowed by
+// networkId/serviceId/eventId, or one program by id.
+func servePrograms(w http.ResponseWriter, r *http.Request, cat catalog, rest []string) {
+	items := cat.programs
+	for key, vals := range r.URL.Query() {
+		if (key != "networkId" && key != "serviceId" && key != "eventId") || len(vals) != 1 {
+			apiError(w, 400, "only numeric networkId/serviceId/eventId filters are supported")
+			return
+		}
+		value, err := strconv.ParseInt(vals[0], 10, 64)
+		if err != nil || value < 0 || value > 65535 {
+			apiError(w, 400, "invalid program filter")
+			return
+		}
+		filtered := []program{}
+		for _, p := range items {
+			var field int64
+			switch key {
+			case "networkId":
+				field = p.networkID
+			case "serviceId":
+				field = p.serviceID
+			case "eventId":
+				field = p.eventID
+			}
+			if field == value {
+				filtered = append(filtered, p)
+			}
+		}
+		items = filtered
+	}
+	switch len(rest) {
+	case 0:
+		var cached *jsonBody
+		if r.URL.RawQuery == "" {
+			cached = cat.programsJSON
+		}
+		serveCatalog(w, r, cat.gen, items, cached)
+	case 1:
+		id, err := strconv.ParseInt(rest[0], 10, 64)
+		if err != nil {
+			apiError(w, 400, "invalid id")
+			return
+		}
+		for _, p := range items {
+			if p.id == id {
+				serveCatalog(w, r, cat.gen, p, nil)
+				return
+			}
+		}
+		apiError(w, 404, "not found")
+	default:
+		apiError(w, 404, "not found")
+	}
 }
 
 // nilIfZero renders zero timestamps as JSON null instead of the year-1 time.

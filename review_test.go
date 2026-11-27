@@ -60,8 +60,8 @@ func TestValidateCatalogRejects(t *testing.T) {
 	if err := validateCatalog([]object{good}, nil); err != nil {
 		t.Fatalf("good catalog rejected: %v", err)
 	}
-	p := object{"id": jn("1"), "networkId": jn("1"), "serviceId": jn("1"), "eventId": jn("1")}
-	if err := validateCatalog(nil, []object{p}); err == nil {
+	p := program{id: 1, networkID: 1, serviceID: 1, eventID: 1}
+	if err := validateCatalog(nil, []program{p}); err == nil {
 		t.Error("bad program id accepted")
 	}
 }
@@ -162,6 +162,42 @@ func TestFetchRejectsBadBodies(t *testing.T) {
 		srv.Close()
 		if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "a/services") {
 			t.Errorf("%s: got %v", body, err)
+		}
+	}
+}
+
+// Programs answer with their upstream JSON unchanged, and the four fields are
+// validated with the same rules objects used to get.
+func TestFetchProgramsKeepsUpstreamJSON(t *testing.T) {
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+	defer srv.Close()
+	g, err := NewGateway(Config{Listen: ":1", SyncSeconds: 1, CatalogTimeoutSeconds: 1, MaxStaleSeconds: 60, StreamTimeoutSeconds: 1, Backends: []BackendConfig{{ID: "a", URL: srv.URL}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetch := func() ([]program, error) { return g.fetchPrograms(context.Background(), g.backends[0]) }
+
+	raw := `{"genre":1,"id":10001000003,"networkId":1,"serviceId":10,"eventId":3}`
+	body = "[" + raw + "]"
+	programs, err := fetch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(programs) != 1 || string(programs[0].raw) != raw || programs[0].id != 10001000003 || programs[0].networkID != 1 || programs[0].serviceID != 10 || programs[0].eventID != 3 {
+		t.Fatalf("unexpected program: %+v", programs)
+	}
+	if err := validateCatalog(nil, programs); err != nil {
+		t.Fatalf("good program rejected: %v", err)
+	}
+	for _, bad := range []string{`"id":"10001000003"`, `"id":10001000003.5`} {
+		body = "[" + strings.Replace(raw, `"id":10001000003`, bad, 1) + "]"
+		programs, err := fetch()
+		if err != nil {
+			t.Fatalf("%s: %v", bad, err)
+		}
+		if err := validateCatalog(nil, programs); err == nil {
+			t.Errorf("%s: accepted as a program id", bad)
 		}
 	}
 }
