@@ -68,6 +68,7 @@ docker compose up -d
 | `catalog_timeout_seconds` | `20` | 接続先ごとの情報取得の制限時間（秒） |
 | `max_stale_seconds` | `3600` | 最後に取得できた情報の有効期間（秒） |
 | `stream_timeout_seconds` | `30` | 配信の接続・読み書きの制限時間（秒） |
+| `update_check` | `true` | GitHub Releases へのアップデート確認。`false` で無効 |
 
 `max_stale_seconds` は `sync_seconds + catalog_timeout_seconds` 以上にします。[設定例](sakurako.example.json)も参照してください。
 
@@ -80,20 +81,13 @@ docker compose up -d
 - BS/CS では `networkId` が多くの放送で共通なので、別の放送を指していてもこの仕組みでは検出できません。実質的には GR 向けの保護です。
 - sakurako の起動直後、優先度が最も高い接続先からまだ一度もサービス情報を取得できていない場合は、競合を検出できません。
 
+`update_check` が `true` のとき、起動時に 1 回、その後 6 時間ごとに GitHub Releases の最新安定版を確認し、稼働中のバージョンより新しいときだけ管理画面のロゴ横に `Update available (v0.5.0)` のリンクを表示します。比較できない `dev` ビルドでは表示しません。確認に失敗した場合は確認不能として扱い、次の確認で再試行します（稼働中のバージョンとダッシュボードはそのまま表示されます）。`false` にすると GitHub へは問い合わせませんが、稼働中のバージョンは表示されます。
+
 ## 環境変数
 
 | 変数 | 既定値 | 説明 |
 | --- | --- | --- |
-| `SAKURAKO_UPDATE_CHECK` | `true` | `false` で GitHub Releases へのアップデート確認を無効にする |
-
-アップデート確認は起動時に 1 回、その後 6 時間ごとに GitHub Releases の最新安定版を確認し、稼働中のバージョンより新しいときだけ管理画面のロゴ横に `Update available (v0.5.0)` のリンクを表示します。比較できない `dev` ビルドでは表示しません。確認に失敗した場合は確認不能として扱い、次の確認で再試行します（稼働中のバージョンとダッシュボードはそのまま表示されます）。`false` にすると GitHub へは問い合わせませんが、稼働中のバージョンは表示されます。Docker Compose では `environment:` で渡せます。
-
-```yaml
-services:
-  sakurako:
-    environment:
-      - SAKURAKO_UPDATE_CHECK=false
-```
+| `SAKURAKO_UPDATE_CHECK` | `true` | v0.5.0 との互換のため残っています。`false` でアップデート確認を無効にしますが、設定ファイルの `update_check` を使ってください |
 
 ## 仕組み
 
