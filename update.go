@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,17 +38,11 @@ func (c *updateCache) set(latest object) {
 	c.mu.Unlock()
 }
 
-// updateCheckEnabled honors SAKURAKO_UPDATE_CHECK: unset or any value other than
-// "false" enables the check.
-func updateCheckEnabled() bool {
-	return !strings.EqualFold(strings.TrimSpace(os.Getenv("SAKURAKO_UPDATE_CHECK")), "false")
-}
-
 // RunUpdateCheck checks once at startup and then every updateCheckInterval. It is
 // a separate loop from Run so startup never waits on GitHub and tests calling
-// Run never reach the network.
+// Run never reach the network. It returns at once when update_check is false.
 func (g *Gateway) RunUpdateCheck(ctx context.Context) {
-	if !updateCheckEnabled() {
+	if !g.config.UpdateCheck {
 		return
 	}
 	t := time.NewTicker(updateCheckInterval)

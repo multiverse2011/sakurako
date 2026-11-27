@@ -394,7 +394,7 @@
           "type": "integer"
         "update":
           "additionalProperties": true
-          "description": "Newest stable release when it is newer than the running version; null while none has been found, including when this build is current, the version cannot be compared or SAKURAKO_UPDATE_CHECK=false. A failed check keeps the previous result."
+          "description": "Newest stable release when it is newer than the running version; null while none has been found, including when this build is current, the version cannot be compared or update_check is false in the config. A failed check keeps the previous result."
           "nullable": true
           "properties":
             "url":

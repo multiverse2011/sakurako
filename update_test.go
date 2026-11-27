@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -167,7 +169,6 @@ func TestUpdateCheckKeepsLastReleaseOnFailure(t *testing.T) {
 }
 
 func TestRunUpdateCheckRetriesOnInterval(t *testing.T) {
-	t.Setenv("SAKURAKO_UPDATE_CHECK", "")
 	setVersion(t, "0.4.0")
 	var requests atomic.Int32
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -255,10 +256,10 @@ func TestNewerVersion(t *testing.T) {
 }
 
 func TestUpdateCheckDisabledSkipsGitHub(t *testing.T) {
-	t.Setenv("SAKURAKO_UPDATE_CHECK", " FALSE ")
 	s, requests := releaseServer(t, 200, releaseBody)
 	setUpdateCheck(t, s.URL, time.Millisecond)
 	g, server := gateway(t, newFake(t, 10, "service"))
+	g.config.UpdateCheck = false // before RunUpdateCheck and the request below
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -290,17 +291,71 @@ func TestUpdateCheckIntervalIsSixHours(t *testing.T) {
 	}
 }
 
-func TestUpdateCheckEnabled(t *testing.T) {
-	for _, tc := range []struct {
-		value string
-		want  bool
-	}{
-		{"", true}, {"true", true}, {" TRUE ", true}, {"1", true},
-		{"false", false}, {" False ", false},
+func TestReadConfigUpdateCheck(t *testing.T) {
+	for raw, want := range map[string]bool{
+		`{"backends":[{"id":"a","url":"http://h/api"}]}`:                      true,
+		`{"update_check":false,"backends":[{"id":"a","url":"http://h/api"}]}`: false,
+		`{"update_check":true,"backends":[{"id":"a","url":"http://h/api"}]}`:  true,
 	} {
-		t.Setenv("SAKURAKO_UPDATE_CHECK", tc.value)
-		if got := updateCheckEnabled(); got != tc.want {
-			t.Errorf("updateCheckEnabled(%q) = %v, want %v", tc.value, got, tc.want)
+		p := filepath.Join(t.TempDir(), "sakurako.json")
+		if err := os.WriteFile(p, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
 		}
+		c, err := readConfig(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.UpdateCheck != want {
+			t.Errorf("%s: update_check = %v, want %v", raw, c.UpdateCheck, want)
+		}
+	}
+}
+
+// The check runs only when update_check is true.
+func TestRunUpdateCheckFollowsConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config bool
+	}{
+		{"enabled", true},
+		{"disabled", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setVersion(t, "0.4.0")
+			s, requests := releaseServer(t, 200, releaseBody)
+			setUpdateCheck(t, s.URL, time.Hour)
+			g, _ := gateway(t, newFake(t, 10, "service"))
+			g.config.UpdateCheck = tc.config // before RunUpdateCheck starts, so no race
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				g.RunUpdateCheck(ctx)
+			}()
+			if tc.config {
+				deadline := time.Now().Add(2 * time.Second)
+				for g.update.get() == nil {
+					if time.Now().After(deadline) {
+						t.Fatalf("no release found after %d requests", requests.Load())
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				cancel()
+			}
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("RunUpdateCheck kept running")
+			}
+			if !tc.config {
+				if got := requests.Load(); got != 0 {
+					t.Fatalf("requests: %d, want none", got)
+				}
+				if update := g.update.get(); update != nil {
+					t.Fatalf("update: %v, want nil", update)
+				}
+			}
+		})
 	}
 }

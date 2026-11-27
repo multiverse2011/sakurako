@@ -30,6 +30,7 @@ type Config struct {
 	StreamTimeoutSeconds  int    `json:"stream_timeout_seconds"`
 	// ChannelNames is "virtual" (backend-prefixed, default) or "upstream" (Mirakurun names).
 	ChannelNames string          `json:"channel_names"`
+	UpdateCheck  bool            `json:"update_check"`
 	Backends     []BackendConfig `json:"backends"`
 }
 
@@ -50,7 +51,7 @@ func readConfig(path string) (Config, error) {
 		return Config{}, err
 	}
 	defer f.Close()
-	c := Config{Listen: ":40772", SyncSeconds: 30, CatalogTimeoutSeconds: 20, MaxStaleSeconds: 3600, StreamTimeoutSeconds: 30, ChannelNames: "virtual"}
+	c := Config{Listen: ":40772", SyncSeconds: 30, CatalogTimeoutSeconds: 20, MaxStaleSeconds: 3600, StreamTimeoutSeconds: 30, ChannelNames: "virtual", UpdateCheck: true}
 	d := json.NewDecoder(f)
 	d.DisallowUnknownFields()
 	if err := d.Decode(&c); err != nil {
