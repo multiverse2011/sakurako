@@ -61,6 +61,12 @@ docker compose up -d
 
 `backends[].url` に Compose のサービス名や `host.docker.internal` を指定すると、管理画面の Mirakurun へのリンクがブラウザから開けません。その場合は `backends[].ui_url` にブラウザから開ける URL を指定してください。
 
+Linux の Docker で `host.docker.internal` を使うには、compose に `extra_hosts: ["host.docker.internal:host-gateway"]` が必要です。同じホストの Mirakurun を `localhost` で指定すると、コンテナ自身を指すため接続できません。
+
+LAN の別の PC から管理画面を開く場合は、`ports` の `127.0.0.1:` を外してください。
+
+Runtime の Environment は、目印（`/.dockerenv` など）のある Docker / Podman / Kubernetes だけを判定します。それ以外のコンテナで動かした場合も Native と表示されます。
+
 ## 設定
 
 設定は `sakurako.json` に記述します。変更後は `docker compose restart sakurako` で再起動してください。
