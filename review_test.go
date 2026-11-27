@@ -119,6 +119,12 @@ func TestReadConfigDefaultsChannelNames(t *testing.T) {
 	if _, err := readConfig(write("ui.json", `{"backends":[{"id":"a","url":"http://h/api","ui_url":"javascript:alert(1)"}]}`)); err == nil {
 		t.Fatal("non-HTTP ui_url accepted")
 	}
+	if _, err := readConfig(write("ui-ok.json", `{"backends":[{"id":"a","url":"http://h/api","ui_url":"http://192.168.1.10:40772/"}]}`)); err != nil {
+		t.Fatalf("valid ui_url rejected: %v", err)
+	}
+	if _, err := readConfig(write("ui-nohost.json", `{"backends":[{"id":"a","url":"http://h/api","ui_url":"http://"}]}`)); err == nil {
+		t.Fatal("ui_url without host accepted")
+	}
 }
 
 func TestServerWriteTimeout(t *testing.T) {

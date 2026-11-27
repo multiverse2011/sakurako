@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -887,5 +888,49 @@ func TestProcRSS(t *testing.T) {
 	}
 	if got := procRSS(p + ".missing"); got != nil {
 		t.Fatalf("missing file: %v", got)
+	}
+	for name, raw := range map[string]string{"no-vmrss": "Name:\tsakurako\n", "not-a-number": "VmRSS:\t   abc kB\n"} {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if got := procRSS(p); got != nil {
+			t.Fatalf("%s: %v", name, got)
+		}
+	}
+}
+
+func TestUIRuntimeEndpoint(t *testing.T) {
+	_, server := gateway(t, newFake(t, 10, "service"))
+	response, err := http.Get(server.URL + "/-/ui/runtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if got := response.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control: %q", got)
+	}
+	var wire map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"environment", "hostname", "rss_bytes", "heap_bytes", "goroutines", "started"} {
+		if _, ok := wire[key]; !ok {
+			t.Fatalf("missing %s: %v", key, wire)
+		}
+	}
+}
+
+func TestUIStateBackendUIURLFromConfig(t *testing.T) {
+	g, server := gateway(t, newFake(t, 10, "service"))
+	changeBackend(g, 0, func(b *backend) { b.config.UIURL = "http://192.168.1.10:40772/" })
+	var wire struct {
+		Backends []struct {
+			UIURL string `json:"ui_url"`
+		} `json:"backends"`
+	}
+	getJSON(t, server.URL+"/-/ui/state", 200, &wire)
+	if len(wire.Backends) != 1 || wire.Backends[0].UIURL != "http://192.168.1.10:40772/" {
+		t.Fatalf("backends: %+v", wire.Backends)
 	}
 }

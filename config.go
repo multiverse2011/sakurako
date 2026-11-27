@@ -118,7 +118,7 @@ func (c Config) validate() error {
 		}
 		if b.UIURL != "" {
 			if u, err := url.Parse(b.UIURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-				return fmt.Errorf("invalid ui_url for %s (HTTP(S) URL required)", b.ID)
+				return fmt.Errorf("invalid ui_url for %s: HTTP(S) URL required (got %q)", b.ID, b.UIURL)
 			}
 		}
 	}
